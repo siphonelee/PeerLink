@@ -1,0 +1,963 @@
+use crate::common::config::PortForwardConfig;
+use crate::proto::peer_rpc::RouteForeignNetworkSummary;
+use crate::proto::web;
+use crate::{
+    common::{
+        config::{
+            gen_default_flags, ConfigLoader, NetworkIdentity, PeerConfig, TomlConfigLoader,
+            VpnPortalConfig,
+        },
+        constants::PEERLINK_VERSION,
+        global_ctx::{EventBusSubscriber, GlobalCtxEvent},
+        stun::StunInfoCollectorTrait,
+    },
+    instance::instance::Instance,
+    peers::rpc_service::PeerManagerRpcService,
+    proto::cli::{list_peer_route_pair, PeerInfo, Route},
+};
+use anyhow::Context;
+use chrono::{DateTime, Local};
+use std::net::SocketAddr;
+use std::{
+    collections::VecDeque,
+    sync::{atomic::AtomicBool, Arc, RwLock},
+};
+use tokio::{sync::broadcast, task::JoinSet};
+
+pub type MyNodeInfo = crate::proto::web::MyNodeInfo;
+
+#[derive(serde::Serialize, Clone)]
+pub struct Event {
+    time: DateTime<Local>,
+    event: GlobalCtxEvent,
+}
+
+struct PeerlinkData {
+    events: RwLock<VecDeque<Event>>,
+    my_node_info: RwLock<MyNodeInfo>,
+    peer_id: RwLock<Option<u32>>,
+    routes: RwLock<Vec<Route>>,
+    peers: RwLock<Vec<PeerInfo>>,
+    foreign_network_summary: RwLock<RouteForeignNetworkSummary>,
+    tun_fd: Arc<RwLock<Option<i32>>>,
+    tun_dev_name: RwLock<String>,
+    event_subscriber: RwLock<broadcast::Sender<GlobalCtxEvent>>,
+    instance_stop_notifier: Arc<tokio::sync::Notify>,
+}
+
+impl Default for PeerlinkData {
+    fn default() -> Self {
+        let (tx, _) = broadcast::channel(16);
+        Self {
+            event_subscriber: RwLock::new(tx),
+            events: RwLock::new(VecDeque::new()),
+            my_node_info: RwLock::new(MyNodeInfo::default()),
+            peer_id: RwLock::new(None),
+            routes: RwLock::new(Vec::new()),
+            peers: RwLock::new(Vec::new()),
+            foreign_network_summary: RwLock::new(RouteForeignNetworkSummary::default()),
+            tun_fd: Arc::new(RwLock::new(None)),
+            tun_dev_name: RwLock::new(String::new()),
+            instance_stop_notifier: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+pub struct PeerlinkLauncher {
+    instance_alive: Arc<AtomicBool>,
+    stop_flag: Arc<AtomicBool>,
+    thread_handle: Option<std::thread::JoinHandle<()>>,
+    running_cfg: String,
+    fetch_node_info: bool,
+
+    error_msg: Arc<RwLock<Option<String>>>,
+    data: Arc<PeerlinkData>,
+}
+
+impl PeerlinkLauncher {
+    pub fn new(fetch_node_info: bool) -> Self {
+        let instance_alive = Arc::new(AtomicBool::new(false));
+        Self {
+            instance_alive,
+            thread_handle: None,
+            error_msg: Arc::new(RwLock::new(None)),
+            running_cfg: String::new(),
+            fetch_node_info,
+
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            data: Arc::new(PeerlinkData::default()),
+        }
+    }
+
+    async fn handle_peerlink_event(event: GlobalCtxEvent, data: &PeerlinkData) {
+        let mut events = data.events.write().unwrap();
+        let _ = data.event_subscriber.read().unwrap().send(event.clone());
+        events.push_front(Event {
+            time: chrono::Local::now(),
+            event,
+        });
+        if events.len() > 20 {
+            events.pop_back();
+        }
+    }
+
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    async fn run_routine_for_android(
+        instance: &Instance,
+        data: &PeerlinkData,
+        tasks: &mut JoinSet<()>,
+    ) {
+        let global_ctx = instance.get_global_ctx();
+        let peer_mgr = instance.get_peer_manager();
+        let nic_ctx = instance.get_nic_ctx();
+        let peer_packet_receiver = instance.get_peer_packet_receiver();
+        let arc_tun_fd = data.tun_fd.clone();
+
+        tasks.spawn(async move {
+            let mut old_tun_fd = arc_tun_fd.read().unwrap().clone();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let tun_fd = arc_tun_fd.read().unwrap().clone();
+                if tun_fd != old_tun_fd && tun_fd.is_some() {
+                    let res = Instance::setup_nic_ctx_for_android(
+                        nic_ctx.clone(),
+                        global_ctx.clone(),
+                        peer_mgr.clone(),
+                        peer_packet_receiver.clone(),
+                        tun_fd.unwrap(),
+                    )
+                    .await;
+                    if res.is_ok() {
+                        old_tun_fd = tun_fd;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn peerlink_routine(
+        cfg: TomlConfigLoader,
+        stop_signal: Arc<tokio::sync::Notify>,
+        data: Arc<PeerlinkData>,
+        fetch_node_info: bool,
+    ) -> Result<(), anyhow::Error> {
+        let exit_node_enabled = cfg.get_flags().enable_exit_node;
+        let mut instance = Instance::new(cfg);
+        let mut tasks = JoinSet::new();
+
+        // Subscribe to global context events
+        let global_ctx = instance.get_global_ctx();
+        let data_c = data.clone();
+        tasks.spawn(async move {
+            let mut receiver = global_ctx.subscribe();
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        Self::handle_peerlink_event(event.clone(), &data_c).await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // do nothing currently
+                        receiver = receiver.resubscribe();
+                    }
+                }
+            }
+        });
+
+        // update my node info
+        if fetch_node_info {
+            let data_c = data.clone();
+            let global_ctx_c = instance.get_global_ctx();
+            let peer_mgr_c = instance.get_peer_manager().clone();
+            let vpn_portal = instance.get_vpn_portal_inst();
+            tasks.spawn(async move {
+                loop {
+                    // Update TUN Device Name
+                    *data_c.tun_dev_name.write().unwrap() =
+                        global_ctx_c.get_flags().dev_name.clone();
+
+                    // Update peer_id from PeerManager
+                    *data_c.peer_id.write().unwrap() = Some(peer_mgr_c.my_peer_id());
+
+                    let node_info = MyNodeInfo {
+                        virtual_ipv4: global_ctx_c.get_ipv4().map(|ip| ip.into()),
+                        hostname: global_ctx_c.get_hostname(),
+                        version: PEERLINK_VERSION.to_string(),
+                        ips: Some(global_ctx_c.get_ip_collector().collect_ip_addrs().await),
+                        stun_info: Some(global_ctx_c.get_stun_info_collector().get_stun_info()),
+                        listeners: global_ctx_c
+                            .get_running_listeners()
+                            .into_iter()
+                            .map(Into::into)
+                            .collect(),
+                        vpn_portal_cfg: Some(
+                            vpn_portal
+                                .lock()
+                                .await
+                                .dump_client_config(peer_mgr_c.clone())
+                                .await,
+                        ),
+                    };
+                    *data_c.my_node_info.write().unwrap() = node_info.clone();
+                    *data_c.routes.write().unwrap() = peer_mgr_c.list_routes().await;
+                    *data_c.peers.write().unwrap() =
+                        PeerManagerRpcService::list_peers(&peer_mgr_c).await;
+                    *data_c.foreign_network_summary.write().unwrap() =
+                        peer_mgr_c.get_foreign_network_summary().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            });
+        }
+
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
+        Self::run_routine_for_android(&instance, &data, &mut tasks).await;
+
+        instance.run().await?;
+
+        // Handle exit node contract operations after instance is fully running
+        if exit_node_enabled {
+            let peer_mgr = instance.get_peer_manager();
+            let my_peer_id = peer_mgr.my_peer_id();
+            
+            // TODO: calvin - Write info to contract, including my_peer_id
+            tracing::info!(?my_peer_id, "Exit node enabled, registering to contract");
+            // Add contract registration logic here
+        }
+
+        stop_signal.notified().await;
+
+        tasks.abort_all();
+        drop(tasks);
+
+        instance.clear_resources().await;
+        drop(instance);
+
+        Ok(())
+    }
+
+    fn select_proper_rpc_port(cfg: &TomlConfigLoader) {
+        let Some(mut f) = cfg.get_rpc_portal() else {
+            return;
+        };
+
+        if f.port() == 0 {
+            let Some(port) = crate::utils::find_free_tcp_port(15888..15900) else {
+                tracing::warn!("No free port found for RPC portal, skipping setting RPC portal");
+                return;
+            };
+            f.set_port(port);
+            cfg.set_rpc_portal(f);
+        }
+    }
+
+    pub fn start<F>(&mut self, cfg_generator: F)
+    where
+        F: FnOnce() -> Result<TomlConfigLoader, anyhow::Error> + Send + Sync,
+    {
+        let error_msg = self.error_msg.clone();
+        let cfg = match cfg_generator() {
+            Err(e) => {
+                error_msg.write().unwrap().replace(e.to_string());
+                return;
+            }
+            Ok(cfg) => cfg,
+        };
+
+        self.running_cfg = cfg.dump();
+
+        Self::select_proper_rpc_port(&cfg);
+
+        let stop_flag = self.stop_flag.clone();
+
+        let instance_alive = self.instance_alive.clone();
+        instance_alive.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let data = self.data.clone();
+        let fetch_node_info = self.fetch_node_info;
+
+        self.thread_handle = Some(std::thread::spawn(move || {
+            let rt = if cfg.get_flags().multi_thread {
+                let worker_threads = 2.max(cfg.get_flags().multi_thread_count as usize);
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(worker_threads)
+                    .enable_all()
+                    .build()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+            }
+            .unwrap();
+
+            let stop_notifier = Arc::new(tokio::sync::Notify::new());
+
+            let stop_notifier_clone = stop_notifier.clone();
+            rt.spawn(async move {
+                while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                stop_notifier_clone.notify_one();
+            });
+
+            let notifier = data.instance_stop_notifier.clone();
+            let ret = rt.block_on(Self::peerlink_routine(
+                cfg,
+                stop_notifier.clone(),
+                data,
+                fetch_node_info,
+            ));
+            if let Err(e) = ret {
+                error_msg.write().unwrap().replace(format!("{:?}", e));
+            }
+            instance_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+            notifier.notify_one();
+        }));
+    }
+
+    pub fn error_msg(&self) -> Option<String> {
+        self.error_msg.read().unwrap().clone()
+    }
+
+    pub fn running(&self) -> bool {
+        self.instance_alive
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn get_dev_name(&self) -> String {
+        self.data.tun_dev_name.read().unwrap().clone()
+    }
+
+    pub fn get_events(&self) -> Vec<Event> {
+        let events = self.data.events.read().unwrap();
+        events.iter().cloned().collect()
+    }
+
+    pub fn get_node_info(&self) -> MyNodeInfo {
+        self.data.my_node_info.read().unwrap().clone()
+    }
+
+    pub fn get_routes(&self) -> Vec<Route> {
+        self.data.routes.read().unwrap().clone()
+    }
+
+    pub fn get_peers(&self) -> Vec<PeerInfo> {
+        self.data.peers.read().unwrap().clone()
+    }
+
+    pub fn get_foreign_network_summary(&self) -> RouteForeignNetworkSummary {
+        self.data.foreign_network_summary.read().unwrap().clone()
+    }
+
+    pub fn get_peer_id(&self) -> Option<u32> {
+        *self.data.peer_id.read().unwrap()
+    }
+}
+
+impl Drop for PeerlinkLauncher {
+    fn drop(&mut self) {
+        self.stop_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.thread_handle.take() {
+            if let Err(e) = handle.join() {
+                println!("Error when joining thread: {:?}", e);
+            }
+        }
+    }
+}
+
+pub type NetworkInstanceRunningInfo = crate::proto::web::NetworkInstanceRunningInfo;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    Cli,
+    File,
+    Web,
+    GUI,
+    FFI,
+}
+
+pub struct NetworkInstance {
+    config: TomlConfigLoader,
+    launcher: Option<PeerlinkLauncher>,
+
+    config_source: ConfigSource,
+}
+
+impl NetworkInstance {
+    pub fn new(config: TomlConfigLoader, source: ConfigSource) -> Self {
+        Self {
+            config,
+            launcher: None,
+            config_source: source,
+        }
+    }
+
+    fn get_fetch_node_info(&self) -> bool {
+        match self.config_source {
+            ConfigSource::Cli | ConfigSource::File => false,
+            ConfigSource::Web | ConfigSource::GUI | ConfigSource::FFI => true,
+        }
+    }
+
+    pub fn get_config_source(&self) -> ConfigSource {
+        self.config_source.clone()
+    }
+
+    pub fn is_peerlink_running(&self) -> bool {
+        self.launcher.is_some() && self.launcher.as_ref().unwrap().running()
+    }
+
+    pub fn get_running_info(&self) -> Option<NetworkInstanceRunningInfo> {
+        self.launcher.as_ref()?;
+
+        let launcher = self.launcher.as_ref().unwrap();
+
+        let peers = launcher.get_peers();
+        let routes = launcher.get_routes();
+        let peer_route_pairs = list_peer_route_pair(peers.clone(), routes.clone());
+
+        Some(NetworkInstanceRunningInfo {
+            dev_name: launcher.get_dev_name(),
+            my_node_info: Some(launcher.get_node_info()),
+            events: launcher
+                .get_events()
+                .iter()
+                .map(|e| serde_json::to_string(e).unwrap())
+                .collect(),
+            routes,
+            peers,
+            peer_route_pairs,
+            running: launcher.running(),
+            error_msg: launcher.error_msg(),
+            foreign_network_summary: Some(launcher.get_foreign_network_summary()),
+        })
+    }
+
+    pub fn get_inst_name(&self) -> String {
+        self.config.get_inst_name()
+    }
+
+    pub fn set_tun_fd(&mut self, tun_fd: i32) {
+        if let Some(launcher) = self.launcher.as_ref() {
+            launcher.data.tun_fd.write().unwrap().replace(tun_fd);
+        }
+    }
+
+    pub fn start(&mut self) -> Result<EventBusSubscriber, anyhow::Error> {
+        if self.is_peerlink_running() {
+            return Ok(self.subscribe_event().unwrap());
+        }
+
+        let launcher = PeerlinkLauncher::new(self.get_fetch_node_info());
+        self.launcher = Some(launcher);
+        let ev = self.subscribe_event().unwrap();
+
+        self.launcher
+            .as_mut()
+            .unwrap()
+            .start(|| Ok(self.config.clone()));
+
+        Ok(ev)
+    }
+
+    pub fn subscribe_event(&self) -> Option<broadcast::Receiver<GlobalCtxEvent>> {
+        self.launcher
+            .as_ref()
+            .map(|launcher| launcher.data.event_subscriber.read().unwrap().subscribe())
+    }
+
+    pub fn get_stop_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.launcher
+            .as_ref()
+            .map(|launcher| launcher.data.instance_stop_notifier.clone())
+    }
+
+    pub fn get_latest_error_msg(&self) -> Option<String> {
+        if let Some(launcher) = self.launcher.as_ref() {
+            launcher.error_msg.read().unwrap().clone()
+        } else {
+            None
+        }
+    }
+
+    pub fn get_peer_id(&self) -> Option<u32> {
+        self.launcher.as_ref().and_then(|launcher| launcher.get_peer_id())
+    }
+}
+
+pub fn add_proxy_network_to_config(
+    proxy_network: &str,
+    cfg: &TomlConfigLoader,
+) -> Result<(), anyhow::Error> {
+    let parts: Vec<&str> = proxy_network.split("->").collect();
+    let real_cidr = parts[0]
+        .parse()
+        .with_context(|| format!("failed to parse proxy network: {}", parts[0]))?;
+
+    if parts.len() > 2 {
+        return Err(anyhow::anyhow!(
+                    "invalid proxy network format: {}, support format: <real_cidr> or <real_cidr>-><mapped_cidr>, example:
+                    10.0.0.0/24 or 10.0.0.0/24->192.168.0.0/24",
+                    proxy_network
+                ));
+    }
+
+    let mapped_cidr = if parts.len() == 2 {
+        Some(
+            parts[1]
+                .parse()
+                .with_context(|| format!("failed to parse mapped network: {}", parts[1]))?,
+        )
+    } else {
+        None
+    };
+    cfg.add_proxy_cidr(real_cidr, mapped_cidr)?;
+    Ok(())
+}
+
+pub type NetworkingMethod = crate::proto::web::NetworkingMethod;
+pub type NetworkConfig = crate::proto::web::NetworkConfig;
+
+impl NetworkConfig {
+    pub fn gen_config(&self) -> Result<TomlConfigLoader, anyhow::Error> {
+        let cfg = TomlConfigLoader::default();
+        cfg.set_id(
+            self.instance_id
+                .clone()
+                .unwrap_or(uuid::Uuid::new_v4().to_string())
+                .parse()
+                .with_context(|| format!("failed to parse instance id: {:?}", self.instance_id))?,
+        );
+        cfg.set_hostname(self.hostname.clone());
+        cfg.set_dhcp(self.dhcp.unwrap_or_default());
+        cfg.set_inst_name(self.network_name.clone().unwrap_or_default());
+        cfg.set_network_identity(NetworkIdentity::new(
+            self.network_name.clone().unwrap_or_default(),
+            self.network_secret.clone().unwrap_or_default(),
+        ));
+
+        if !cfg.get_dhcp() {
+            let virtual_ipv4 = self.virtual_ipv4.clone().unwrap_or_default();
+            if !virtual_ipv4.is_empty() {
+                let ip = format!("{}/{}", virtual_ipv4, self.network_length.unwrap_or(24))
+                    .parse()
+                    .with_context(|| {
+                        format!(
+                            "failed to parse ipv4 inet address: {}, {:?}",
+                            virtual_ipv4, self.network_length
+                        )
+                    })?;
+                cfg.set_ipv4(Some(ip));
+            }
+        }
+
+        match NetworkingMethod::try_from(self.networking_method.unwrap_or_default())
+            .unwrap_or_default()
+        {
+            NetworkingMethod::PublicServer => {
+                let public_server_url = self.public_server_url.clone().unwrap_or_default();
+                cfg.set_peers(vec![PeerConfig {
+                    uri: public_server_url.parse().with_context(|| {
+                        format!("failed to parse public server uri: {}", public_server_url)
+                    })?,
+                }]);
+            }
+            NetworkingMethod::Manual => {
+                let mut peers = vec![];
+                for peer_url in self.peer_urls.iter() {
+                    if peer_url.is_empty() {
+                        continue;
+                    }
+                    peers.push(PeerConfig {
+                        uri: peer_url
+                            .parse()
+                            .with_context(|| format!("failed to parse peer uri: {}", peer_url))?,
+                    });
+                }
+
+                cfg.set_peers(peers);
+            }
+            NetworkingMethod::Standalone => {}
+        }
+
+        let mut listener_urls = vec![];
+        for listener_url in self.listener_urls.iter() {
+            if listener_url.is_empty() {
+                continue;
+            }
+            listener_urls.push(
+                listener_url
+                    .parse()
+                    .with_context(|| format!("failed to parse listener uri: {}", listener_url))?,
+            );
+        }
+        cfg.set_listeners(listener_urls);
+
+        for n in self.proxy_cidrs.iter() {
+            add_proxy_network_to_config(n, &cfg)?;
+        }
+
+        cfg.set_rpc_portal(
+            format!("0.0.0.0:{}", self.rpc_port.unwrap_or_default())
+                .parse()
+                .with_context(|| format!("failed to parse rpc portal port: {:?}", self.rpc_port))?,
+        );
+
+        if self.rpc_portal_whitelists.is_empty() {
+            cfg.set_rpc_portal_whitelist(None);
+        } else {
+            cfg.set_rpc_portal_whitelist(Some(
+                self.rpc_portal_whitelists
+                    .iter()
+                    .map(|s| {
+                        s.parse()
+                            .with_context(|| format!("failed to parse rpc portal whitelist: {}", s))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ));
+        }
+
+        if !self.port_forwards.is_empty() {
+            cfg.set_port_forwards(
+                self.port_forwards
+                    .iter()
+                    .filter(|pf| !pf.bind_ip.is_empty() && !pf.dst_ip.is_empty())
+                    .filter_map(|pf| {
+                        let bind_addr =
+                            format!("{}:{}", pf.bind_ip, pf.bind_port).parse::<SocketAddr>();
+                        let dst_addr =
+                            format!("{}:{}", pf.dst_ip, pf.dst_port).parse::<SocketAddr>();
+
+                        match (bind_addr, dst_addr) {
+                            (Ok(bind_addr), Ok(dst_addr)) => Some(PortForwardConfig {
+                                bind_addr,
+                                dst_addr,
+                                proto: pf.proto.clone(),
+                            }),
+                            _ => None,
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        if self.enable_vpn_portal.unwrap_or_default() {
+            let cidr = format!(
+                "{}/{}",
+                self.vpn_portal_client_network_addr
+                    .clone()
+                    .unwrap_or_default(),
+                self.vpn_portal_client_network_len.unwrap_or(24)
+            );
+            cfg.set_vpn_portal_config(VpnPortalConfig {
+                client_cidr: cidr
+                    .parse()
+                    .with_context(|| format!("failed to parse vpn portal client cidr: {}", cidr))?,
+                wireguard_listen: format!(
+                    "0.0.0.0:{}",
+                    self.vpn_portal_listen_port.unwrap_or_default()
+                )
+                .parse()
+                .with_context(|| {
+                    format!(
+                        "failed to parse vpn portal wireguard listen port. {:?}",
+                        self.vpn_portal_listen_port
+                    )
+                })?,
+            });
+        }
+
+        if self.enable_manual_routes.unwrap_or_default() {
+            let mut routes = Vec::<cidr::Ipv4Cidr>::with_capacity(self.routes.len());
+            for route in self.routes.iter() {
+                routes.push(
+                    route
+                        .parse()
+                        .with_context(|| format!("failed to parse route: {}", route))?,
+                );
+            }
+            cfg.set_routes(Some(routes));
+        }
+
+        if !self.exit_nodes.is_empty() {
+            let mut exit_nodes = Vec::<std::net::IpAddr>::with_capacity(self.exit_nodes.len());
+            for node in self.exit_nodes.iter() {
+                exit_nodes.push(
+                    node.parse()
+                        .with_context(|| format!("failed to parse exit node: {}", node))?,
+                );
+            }
+            cfg.set_exit_nodes(exit_nodes);
+        }
+
+        if self.enable_socks5.unwrap_or_default() {
+            if let Some(socks5_port) = self.socks5_port {
+                cfg.set_socks5_portal(Some(
+                    format!("socks5://0.0.0.0:{}", socks5_port).parse().unwrap(),
+                ));
+            }
+        }
+
+        if !self.mapped_listeners.is_empty() {
+            cfg.set_mapped_listeners(Some(
+                self.mapped_listeners
+                    .iter()
+                    .map(|s| {
+                        s.parse()
+                            .with_context(|| format!("mapped listener is not a valid url: {}", s))
+                            .unwrap()
+                    })
+                    .map(|s: url::Url| {
+                        if s.port().is_none() {
+                            panic!("mapped listener port is missing: {}", s);
+                        }
+                        s
+                    })
+                    .collect(),
+            ));
+        }
+
+        let mut flags = gen_default_flags();
+        if let Some(latency_first) = self.latency_first {
+            flags.latency_first = latency_first;
+        }
+
+        if let Some(dev_name) = self.dev_name.clone() {
+            flags.dev_name = dev_name;
+        }
+
+        if let Some(use_smoltcp) = self.use_smoltcp {
+            flags.use_smoltcp = use_smoltcp;
+        }
+
+        if let Some(disable_ipv6) = self.disable_ipv6 {
+            flags.enable_ipv6 = !disable_ipv6;
+        }
+
+        if let Some(enable_kcp_proxy) = self.enable_kcp_proxy {
+            flags.enable_kcp_proxy = enable_kcp_proxy;
+        }
+
+        if let Some(disable_kcp_input) = self.disable_kcp_input {
+            flags.disable_kcp_input = disable_kcp_input;
+        }
+
+        if let Some(enable_quic_proxy) = self.enable_quic_proxy {
+            flags.enable_quic_proxy = enable_quic_proxy;
+        }
+
+        if let Some(disable_quic_input) = self.disable_quic_input {
+            flags.disable_quic_input = disable_quic_input;
+        }
+
+        if let Some(disable_p2p) = self.disable_p2p {
+            flags.disable_p2p = disable_p2p;
+        }
+
+        if let Some(bind_device) = self.bind_device {
+            flags.bind_device = bind_device;
+        }
+
+        if let Some(no_tun) = self.no_tun {
+            flags.no_tun = no_tun;
+        }
+
+        if let Some(enable_exit_node) = self.enable_exit_node {
+            flags.enable_exit_node = enable_exit_node;
+        }
+
+        if let Some(relay_all_peer_rpc) = self.relay_all_peer_rpc {
+            flags.relay_all_peer_rpc = relay_all_peer_rpc;
+        }
+
+        if let Some(multi_thread) = self.multi_thread {
+            flags.multi_thread = multi_thread;
+        }
+
+        if let Some(proxy_forward_by_system) = self.proxy_forward_by_system {
+            flags.proxy_forward_by_system = proxy_forward_by_system;
+        }
+
+        if let Some(disable_encryption) = self.disable_encryption {
+            flags.enable_encryption = !disable_encryption;
+        }
+
+        if self.enable_relay_network_whitelist.unwrap_or_default() {
+            if !self.relay_network_whitelist.is_empty() {
+                flags.relay_network_whitelist = self.relay_network_whitelist.join(" ");
+            } else {
+                flags.relay_network_whitelist = "".to_string();
+            }
+        }
+
+        if let Some(disable_udp_hole_punching) = self.disable_udp_hole_punching {
+            flags.disable_udp_hole_punching = disable_udp_hole_punching;
+        }
+
+        if let Some(disable_sym_hole_punching) = self.disable_sym_hole_punching {
+            flags.disable_sym_hole_punching = disable_sym_hole_punching;
+        }
+
+        if let Some(enable_magic_dns) = self.enable_magic_dns {
+            flags.accept_dns = enable_magic_dns;
+        }
+
+        if let Some(mtu) = self.mtu {
+            flags.mtu = mtu as u32;
+        }
+
+        if let Some(enable_private_mode) = self.enable_private_mode {
+            flags.private_mode = enable_private_mode;
+        }
+
+        cfg.set_flags(flags);
+        Ok(cfg)
+    }
+
+    pub fn new_from_config(config: &TomlConfigLoader) -> Result<Self, anyhow::Error> {
+        let default_config = TomlConfigLoader::default();
+
+        let mut result = Self {
+            ..Default::default()
+        };
+
+        result.instance_id = Some(config.get_id().to_string());
+        if config.get_hostname() != default_config.get_hostname() {
+            result.hostname = Some(config.get_hostname());
+        }
+
+        result.dhcp = Some(config.get_dhcp());
+
+        let network_identity = config.get_network_identity();
+        result.network_name = Some(network_identity.network_name.clone());
+        result.network_secret = network_identity.network_secret.clone();
+
+        if let Some(ipv4) = config.get_ipv4() {
+            result.virtual_ipv4 = Some(ipv4.address().to_string());
+            result.network_length = Some(ipv4.network_length() as i32);
+        }
+
+        let peers = config.get_peers();
+        match peers.len() {
+            1 => {
+                result.networking_method = Some(NetworkingMethod::PublicServer as i32);
+                result.public_server_url = Some(peers[0].uri.to_string());
+            }
+            0 => {
+                result.networking_method = Some(NetworkingMethod::Standalone as i32);
+            }
+            _ => {
+                result.networking_method = Some(NetworkingMethod::Manual as i32);
+                result.peer_urls = peers.iter().map(|p| p.uri.to_string()).collect();
+            }
+        }
+
+        result.listener_urls = config
+            .get_listeners()
+            .unwrap_or_default()
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+
+        result.proxy_cidrs = config
+            .get_proxy_cidrs()
+            .iter()
+            .map(|c| {
+                if let Some(mapped) = c.mapped_cidr {
+                    format!("{}->{}", c.cidr, mapped)
+                } else {
+                    c.cidr.to_string()
+                }
+            })
+            .collect();
+
+        if let Some(rpc_portal) = config.get_rpc_portal() {
+            result.rpc_port = Some(rpc_portal.port() as i32);
+        }
+
+        if let Some(whitelist) = config.get_rpc_portal_whitelist() {
+            result.rpc_portal_whitelists = whitelist.iter().map(|w| w.to_string()).collect();
+        }
+
+        let port_forwards = config.get_port_forwards();
+        if !port_forwards.is_empty() {
+            result.port_forwards = port_forwards
+                .iter()
+                .map(|f| web::PortForwardConfig {
+                    proto: f.proto.clone(),
+                    bind_ip: f.bind_addr.ip().to_string(),
+                    bind_port: f.bind_addr.port() as u32,
+                    dst_ip: f.dst_addr.ip().to_string(),
+                    dst_port: f.dst_addr.port() as u32,
+                })
+                .collect();
+        }
+
+        if let Some(vpn_config) = config.get_vpn_portal_config() {
+            result.enable_vpn_portal = Some(true);
+
+            let cidr = vpn_config.client_cidr;
+            result.vpn_portal_client_network_addr = Some(cidr.first_address().to_string());
+            result.vpn_portal_client_network_len = Some(cidr.network_length() as i32);
+
+            result.vpn_portal_listen_port = Some(vpn_config.wireguard_listen.port() as i32);
+        }
+
+        if let Some(routes) = config.get_routes() {
+            if !routes.is_empty() {
+                result.enable_manual_routes = Some(true);
+                result.routes = routes.iter().map(|r| r.to_string()).collect();
+            }
+        }
+
+        let exit_nodes = config.get_exit_nodes();
+        if !exit_nodes.is_empty() {
+            result.exit_nodes = exit_nodes.iter().map(|n| n.to_string()).collect();
+        }
+
+        if let Some(socks5_portal) = config.get_socks5_portal() {
+            result.enable_socks5 = Some(true);
+            result.socks5_port = socks5_portal.port().map(|p| p as i32);
+        }
+
+        let mapped_listeners = config.get_mapped_listeners();
+        if !mapped_listeners.is_empty() {
+            result.mapped_listeners = mapped_listeners.iter().map(|l| l.to_string()).collect();
+        }
+
+        let flags = config.get_flags();
+        result.latency_first = Some(flags.latency_first);
+        result.dev_name = Some(flags.dev_name.clone());
+        result.use_smoltcp = Some(flags.use_smoltcp);
+        result.disable_ipv6 = Some(!flags.enable_ipv6);
+        result.enable_kcp_proxy = Some(flags.enable_kcp_proxy);
+        result.disable_kcp_input = Some(flags.disable_kcp_input);
+        result.enable_quic_proxy = Some(flags.enable_quic_proxy);
+        result.disable_quic_input = Some(flags.disable_quic_input);
+        result.disable_p2p = Some(flags.disable_p2p);
+        result.bind_device = Some(flags.bind_device);
+        result.no_tun = Some(flags.no_tun);
+        result.enable_exit_node = Some(flags.enable_exit_node);
+        result.relay_all_peer_rpc = Some(flags.relay_all_peer_rpc);
+        result.multi_thread = Some(flags.multi_thread);
+        result.proxy_forward_by_system = Some(flags.proxy_forward_by_system);
+        result.disable_encryption = Some(!flags.enable_encryption);
+        result.disable_udp_hole_punching = Some(flags.disable_udp_hole_punching);
+        result.enable_magic_dns = Some(flags.accept_dns);
+        result.mtu = Some(flags.mtu as i32);
+        result.enable_private_mode = Some(flags.private_mode);
+
+        if !flags.relay_network_whitelist.is_empty() && flags.relay_network_whitelist != "*" {
+            result.enable_relay_network_whitelist = Some(true);
+            result.relay_network_whitelist = flags
+                .relay_network_whitelist
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+        }
+
+        Ok(result)
+    }
+}

@@ -1,0 +1,13 @@
+# Generated files
+**/target/
+**/debug/
+
+**/*.rs.bk
+**/*.bak
+**/wireguard.toml
+
+# Environment files containing sensitive information
+**/.sui.env
+**/.env
+
+.

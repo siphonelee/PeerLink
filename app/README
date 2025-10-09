@@ -1,0 +1,68 @@
+# PeerLink
+
+A full meshed p2p VPN with control plane on Sui network, connecting all your devices in one network with one command.
+
+## Building
+
+```bash
+cargo build --release --target x86_64-apple-darwin
+cargo build --release --target x86_64-unknown-linux-gnu
+```
+
+## Configuration
+
+### Sui Blockchain Configuration
+
+Before using the network management features, you need to configure your Sui blockchain credentials:
+
+1. Copy the example environment file:
+   ```bash
+   cp .sui.env.example .sui.env
+   ```
+
+2. Edit `.sui.env` and fill in your actual values:
+   ```bash
+   # Your Sui private key (starts with 'suiprivkey1')
+   SUI_PRIVATE_KEY=your_private_key_here
+   
+   # Sui package ID (starts with '0x')
+   SUI_PACKAGE_ID=your_package_id_here
+   
+   # Sui registry object ID (starts with '0x')
+   SUI_REGISTRY_ID=your_registry_id_here
+   
+   # Sui registry version (numeric)
+   SUI_REGISTRY_VERSION=your_registry_version_here
+   
+   # Sui registry digest
+   SUI_REGISTRY_DIGEST=your_registry_digest_here
+   ```
+
+**Important**: Never commit the `.sui.env` file to version control as it contains sensitive information.
+
+## Usage
+
+### Network Management
+
+List all networks:
+```bash
+./target/debug/peerlink-cli network list
+```
+
+Create a new network:
+```bash
+./target/debug/peerlink-cli network create <name> <secret> -d "<description>"
+```
+
+Get network information:
+```bash
+./target/debug/peerlink-cli network info <name>
+```
+
+### Output Formats
+
+Use `-o json` for JSON output:
+```bash
+./target/debug/peerlink-cli -o json network list
+```
+
