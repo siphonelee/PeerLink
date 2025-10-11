@@ -109,6 +109,7 @@ prost-types = "0.13"
 anyhow = "1.0"
 bcs = "0.1.6"
 dotenvy = "0.15"
+hex = "0.4"
 
 url = { version = "2.5", features = ["serde"] }
 percent-encoding = "2.3.1"

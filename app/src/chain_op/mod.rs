@@ -78,6 +78,18 @@ pub struct NetworkSummary {
     pub max_peers: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct NetworkDetails {
+    pub name: String,
+    pub secret: String,
+    pub admin: String,
+    pub created_at: u64,
+    pub is_active: bool,
+    pub description: Option<String>,
+    pub max_peers: u64,
+    pub total_exit_nodes: u64,
+}
+
 /// Exit node information for networks
 #[derive(Debug, Clone)]
 pub struct ExitNodeInfo {
@@ -121,7 +133,7 @@ pub trait ChainOperationInterface: Send + Sync {
     /// 
     /// # Returns
     /// * `ChainResult<Option<NetworkInfo>>` - Network info if found
-    async fn get_network(&self, name: &str) -> ChainResult<Option<NetworkInfo>>;
+    async fn get_network(&self, name: &str) -> ChainResult<Option<NetworkDetails>>;
 
     /// List all networks
     /// 
@@ -239,9 +251,18 @@ impl ChainOperationInterface for MockChainOperation {
         })
     }
 
-    async fn get_network(&self, name: &str) -> ChainResult<Option<NetworkInfo>> {
+    async fn get_network(&self, name: &str) -> ChainResult<Option<NetworkDetails>> {
         let networks = self.networks.lock().unwrap();
-        Ok(networks.get(name).cloned())
+        Ok(networks.get(name).map(|network| NetworkDetails {
+            name: network.name.clone(),
+            secret: network.secret.clone(),
+            admin: network.admin.clone(),
+            created_at: network.created_at,
+            is_active: network.is_active,
+            description: network.description.clone(),
+            max_peers: network.max_peers.unwrap_or(0),
+            total_exit_nodes: network.exit_nodes.len() as u64,
+        }))
     }
 
     async fn list_networks(&self) -> ChainResult<Vec<NetworkSummary>> {

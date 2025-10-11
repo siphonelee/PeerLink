@@ -1316,73 +1316,72 @@ impl CommandHandler<'_> {
             return Err(anyhow::anyhow!("Network name cannot be empty"));
         }
         
-        // TODO: Initialize SuiChainOperation with proper configuration
-        // let chain_op = SuiChainOperation::new(
-        //     "private_key".to_string(),
-        //     "package_id".to_string(),
-        //     1u64,
-        //     "package_digest".to_string(),
-        //     "registry_id".to_string(),
-        // );
+        let sui_config = load_sui_config()?;
+        let chain_op = SuiChainOperator::new(
+            sui_config.private_key,
+            sui_config.package_id,
+            sui_config.registry_version,
+            sui_config.registry_digest,
+            sui_config.registry_id,
+        );
         
-        // TODO: Call the actual get_network function
-        // let network = chain_op.get_network(name).await?;
-        // if let Some(network_info) = network {
-        //     // Process and display network info
-        // } else {
-        //     println!("Network '{}' not found", name);
-        //     return Ok(());
-        // }
-        
-        // For now, show a structured placeholder response
-        if self.verbose || *self.output_format == OutputFormat::Json {
-            let placeholder_network = serde_json::json!({
-                "name": name,
-                "admin": "0x1234567890abcdef1234567890abcdef12345678",
-                "created_at": 1697123456,
-                "is_active": true,
-                "description": format!("Detailed information for network '{}'", name),
-                "max_peers": 1000,
-                "current_peers": 0,
-                "exit_nodes": [],
-                "settings": {
-                    "encryption": "AES-256",
-                    "protocol": "WireGuard",
-                    "region": "global"
-                },
-                "stats": {
-                    "total_connections": 0,
-                    "data_transferred": "0 MB",
-                    "uptime": "0 days"
+        // Call the actual get_network function
+        match chain_op.get_network(name).await {
+            Ok(Some(network_details)) => {
+                // Detailed info format
+                println!("Network Information:");
+                println!("==================");
+                println!("Name: {}", network_details.name);
+                println!("Admin: {}", network_details.admin);
+                println!("Status: {}", if network_details.is_active { "Active" } else { "Inactive" });
+                
+                // Format timestamp
+                let timestamp_ms = network_details.created_at;
+                let timestamp_secs = timestamp_ms / 1000;
+                let created_str = match chrono::DateTime::from_timestamp(timestamp_secs as i64, ((timestamp_ms % 1000) * 1_000_000) as u32) {
+                    Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                    None => format!("Timestamp: {}", timestamp_ms),
+                };
+                println!("Created: {}", created_str);
+                
+                println!("Max Peers: {}", network_details.max_peers);
+                println!("Exit Nodes: {} configured", network_details.total_exit_nodes);
+                
+                if let Some(desc) = &network_details.description {
+                    println!("Description: {}", desc);
                 }
-            });
-            println!("{}", serde_json::to_string_pretty(&placeholder_network)?);
-        } else {
-            // Detailed info format
-            println!("Network Information:");
-            println!("==================");
-            println!("Name: {}", name);
-            println!("Admin: 0x1234...5678");
-            println!("Status: Active");
-            println!("Created: 2023-10-12 15:30:56 UTC");
-            println!("Max Peers: 1000");
-            println!("Current Peers: 0");
-            println!("Description: Detailed information for network '{}'", name);
-            println!();
-            println!("Settings:");
-            println!("  Encryption: AES-256");
-            println!("  Protocol: WireGuard");
-            println!("  Region: Global");
-            println!();
-            println!("Statistics:");
-            println!("  Total Connections: 0");
-            println!("  Data Transferred: 0 MB");
-            println!("  Uptime: 0 days");
-            println!();
-            println!("Exit Nodes: None configured");
+                
+                if !network_details.is_active {
+                    println!("\n⚠️  Warning: This network is currently inactive");
+                }
+            }
+            Ok(None) => {
+                if self.output_format == &OutputFormat::Json {
+                    let error_result = serde_json::json!({
+                        "success": false,
+                        "error": format!("Network '{}' not found", name),
+                        "network_name": name
+                    });
+                    println!("{}", serde_json::to_string_pretty(&error_result)?);
+                } else {
+                    println!("Network '{}' not found", name);
+                }
+            }
+            Err(e) => {
+                if self.output_format == &OutputFormat::Json {
+                    let error_result = serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                        "network_name": name
+                    });
+                    println!("{}", serde_json::to_string_pretty(&error_result)?);
+                } else {
+                    eprintln!("Failed to get network '{}': {}", name, e);
+                }
+                return Err(e.into());
+            }
         }
         
-        println!("\nNote: This is placeholder data. Blockchain integration is pending.");
         Ok(())
     }
 

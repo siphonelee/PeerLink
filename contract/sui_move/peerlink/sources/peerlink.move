@@ -301,7 +301,7 @@ public fun get_active_networks(registry: &NetworkRegistry): vector<NetworkSummar
 public fun get_network_info(
     registry: &NetworkRegistry,
     network_name: String
-): (String, address, u64, bool, String, u64) {
+): (String, address, u64, bool, String, u64, u64) {
     assert!(table::contains(&registry.networks, network_name), E_NETWORK_NOT_FOUND);
     
     let network_info = table::borrow(&registry.networks, network_name);
@@ -311,7 +311,8 @@ public fun get_network_info(
         network_info.created_at,
         network_info.is_active,
         network_info.description,
-        network_info.max_peers
+        network_info.max_peers,
+        network_info.exit_node_peer_ids.length(),
     )
 }
 

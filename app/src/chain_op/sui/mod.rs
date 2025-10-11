@@ -1,4 +1,4 @@
-use crate::{chain_op::NetworkSummary, common::PeerId};
+use crate::{chain_op::{NetworkDetails, NetworkSummary}, common::PeerId};
 use super::{
     ChainOperationInterface, ChainResult, ChainOperationError, 
     NetworkInfo, ExitNodeInfo, TransactionResponse
@@ -8,7 +8,7 @@ use sui_config::{
     sui_config_dir, Config, PersistedConfig, SUI_CLIENT_CONFIG, SUI_KEYSTORE_FILENAME,
 };
 use futures::{future, stream::StreamExt};
-use sui_json_rpc_types::{BalanceChange, Coin, SuiExecutionStatus, SuiObjectDataOptions, SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI};
+use sui_json_rpc_types::{BalanceChange, Coin, SuiExecutionStatus, SuiObjectDataOptions, SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI, SuiTypeTag};
 use fastcrypto::{
     ed25519::Ed25519KeyPair,
     encoding::{Base64, Encoding},
@@ -304,6 +304,127 @@ impl SuiChainOperator {
         
         Ok((network, offset))
     }
+
+    /// Parse network info from a tuple returned by get_network_info Move function
+    /// The tuple format is: (String, address, u64, bool, String, u64, u64)
+    /// which corresponds to: (name, admin, created_at, is_active, description, max_peers)
+    fn parse_network_info_tuple(&self, ret_values: &Vec<(Vec<u8>, SuiTypeTag)>, expected_name: &str) -> Result<Option<NetworkDetails>, Box<dyn std::error::Error>> {
+        if ret_values.is_empty() {
+            return Ok(None);
+        }
+        if ret_values.len() != 7 {
+            return Err(format!("network info has no enough fields, expected: 7, but {} available", ret_values.len()).into());
+        }
+
+        let mut name = String::new();
+        let mut admin = String::new();
+        let mut created_at = 0u64;
+        let mut is_active = false;
+        let mut description = String::new();
+        let mut max_peers = 0u64;
+        let mut total_exit_nodes = 0u64;
+        for (idx, data) in ret_values.iter().enumerate() {
+            let mut offset = 0;
+
+            // Parse name (length + string) - first element of tuple
+            if data.0.len() < 1 {
+                return Err(format!("Insufficient data for name length: need 1 byte at offset {}, but only {} bytes available", offset, data.0.len()).into());
+            }
+
+            match idx {
+                0 => {
+                    let field_len = data.0[offset] as usize;
+                    offset += 1;
+
+                    if field_len > 1000 {
+                        return Err(format!("Name length {} seems unreasonably large", field_len).into());
+                    }
+                    if offset + field_len > data.0.len() {
+                        return Err(format!("Insufficient data for name: need {} bytes at offset {}, but only {} bytes available", field_len, offset, data.0.len()).into());
+                    }
+                    name = String::from_utf8(data.0[offset..offset + field_len].to_vec())
+                        .map_err(|e| format!("Failed to parse name as UTF-8: {}", e))?;
+
+                    // Verify this is the network we're looking for
+                    if name != expected_name {
+                        tracing::warn!("Expected network name '{}' but got '{}'", expected_name, name);
+                        return Err(format!("network name mismatch, expectd: {}, got: {}", expected_name, name).into());
+                    }
+
+                }
+                1 => {
+                    // Parse admin address (32 bytes for Sui address)
+                    if offset + 32 > data.0.len() {
+                        return Err(format!("Insufficient data for admin address: need 32 bytes at offset {}, but only {} bytes available", offset, data.0.len()).into());
+                    }
+                    let admin_bytes = &data.0[offset..offset + 32];
+                    admin = format!("0x{}", hex::encode(admin_bytes));
+                }
+                2 => {
+                    // Parse created_at (8 bytes u64)
+                    if offset + 8 > data.0.len() {
+                        return Err(format!("Insufficient data for created_at: need 8 bytes at offset {}, but only {} bytes available", offset, data.0.len()).into());
+                    }
+                    created_at = u64::from_le_bytes([
+                        data.0[offset], data.0[offset+1], data.0[offset+2], data.0[offset+3],
+                        data.0[offset+4], data.0[offset+5], data.0[offset+6], data.0[offset+7]
+                    ]);
+                }
+                3 => {
+                    // Parse is_active (1 byte bool)
+                    if offset + 1 > data.0.len() {
+                        return Err(format!("Insufficient data for is_active: need 1 byte at offset {}, but only {} bytes available", offset, data.0.len()).into());
+                    }
+                    is_active = data.0[offset] != 0;
+                }
+                4 => {
+                    // Parse description (length + string)
+                    let desc_len = data.0[offset] as usize;
+                    offset += 1;
+                                        
+                    if offset + desc_len > data.0.len() {
+                        return Err(format!("Insufficient data for description: need {} bytes at offset {}, but only {} bytes available", desc_len, offset, data.0.len()).into());
+                    }
+                    description = String::from_utf8(data.0[offset..offset + desc_len].to_vec())
+                        .map_err(|e| format!("Failed to parse description as UTF-8: {}", e))?;
+                }
+                5 => {
+                    // Parse max_peers (8 bytes u64)
+                    if offset + 8 > data.0.len() {
+                        return Err(format!("Insufficient data for max_peers: need 8 bytes at offset {}, but only {} bytes available", offset, data.0.len()).into());
+                    }
+                    max_peers = u64::from_le_bytes([
+                        data.0[offset], data.0[offset+1], data.0[offset+2], data.0[offset+3],
+                        data.0[offset+4], data.0[offset+5], data.0[offset+6], data.0[offset+7]
+                    ]);
+                }
+                6 => {
+                    // Parse total exit nodes (8 bytes u64)
+                    if offset + 8 > data.0.len() {
+                        return Err(format!("Insufficient data for total_exit_nodes: need 8 bytes at offset {}, but only {} bytes available", offset, data.0.len()).into());
+                    }
+                    total_exit_nodes = u64::from_le_bytes([
+                        data.0[offset], data.0[offset+1], data.0[offset+2], data.0[offset+3],
+                        data.0[offset+4], data.0[offset+5], data.0[offset+6], data.0[offset+7]
+                    ]);
+                }
+                _ => {}
+            }            
+        }
+
+        let network_details = NetworkDetails {
+            name,
+            secret: String::new(), // Empty for security - use get_network_secret separately if needed
+            admin,
+            created_at,
+            is_active,
+            description: Some(description),
+            max_peers,
+            total_exit_nodes,
+        };
+        
+        Ok(Some(network_details))
+    }
 }
 
 #[async_trait::async_trait]
@@ -434,18 +555,124 @@ impl ChainOperationInterface for SuiChainOperator {
         }
     }
 
-    async fn get_network(&self, name: &str) -> ChainResult<Option<NetworkInfo>> {
+    async fn get_network(&self, name: &str) -> ChainResult<Option<NetworkDetails>> {
         tracing::info!("Getting network '{}' from Sui blockchain", name);
         
+        // Validate input
+        if name.is_empty() {
+            return Err(ChainOperationError::InvalidNetworkName(name.to_string()));
+        }
+        
         // Connect to Sui testnet
-        let _sui_client = SuiClientBuilder::default()
+        let sui_client = SuiClientBuilder::default()
             .build_testnet()
             .await
             .map_err(|e| ChainOperationError::ConnectionError(format!("Failed to connect to Sui testnet: {}", e)))?;
         
-        // TODO: Implement actual network retrieval logic
-        // This would involve querying the Sui network for the specific network object
+        // Parse object IDs to validate them
+        let package_object_id = ObjectID::from_str(&self.package_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid package ID: {}", e)))?;
+        let registry_object_id = ObjectID::from_str(&self.registry_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid registry ID: {}", e)))?;
         
+        // Call get_network_info() Move function using inspect_transaction_block
+        // This is a read-only call that doesn't require gas or signatures
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        
+        // Add registry object as shared object for the read call
+        let registry_arg = CallArg::Object(ObjectArg::SharedObject {
+            id: registry_object_id,
+            initial_shared_version: SequenceNumber::from(self.registry_version),
+            mutable: false, // Read-only access for getting network info
+        });
+        
+        // Add network name argument with proper BCS encoding
+        let network_name_arg = CallArg::Pure(bcs::to_bytes(&name.to_string())
+            .map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize network name: {}", e)))?);
+        
+        // Build the Move call to get_network_info function
+        let result = ptb.move_call(
+            package_object_id,
+            "peerlink".parse().unwrap(),
+            "get_network_info".parse().unwrap(),
+            vec![], // No type arguments
+            vec![registry_arg, network_name_arg],
+        );
+        
+        if let Err(e) = result {
+            return Err(ChainOperationError::TransactionFailed(format!("Failed to build get_network_info call: {:?}", e)));
+        }
+        
+        let programmable_transaction = ptb.finish();
+        
+        // Use a dummy sender address for read-only inspection
+        let (sui, sender) = self.setup_for_read().await
+                                    .map_err(|e| ChainOperationError::SetupReadFailed(format!("Sui Client setup for reading failed: {}", e)))?;
+        
+        let gas_budget = 10_000_000;
+        let gas_price = sui.read_api().get_reference_gas_price().await
+            .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to get Sui gas price: {:?}", e)))?;
+
+        // Build transaction data for inspection (read-only, no execution)
+        let tx_data = TransactionData::new_programmable(
+            sender,
+            vec![], // No gas coins needed for inspection
+            programmable_transaction,
+            gas_budget,
+            gas_price
+        );
+                
+        // Use dev_inspect_transaction_block for read-only execution
+        let inspect_result = sui_client
+            .read_api()
+            .dev_inspect_transaction_block(
+                sender,
+                tx_data.kind().clone(),
+                Some(gas_price.into()),
+                None, // No specific epoch
+                None, // No additional options
+            )
+            .await
+            .map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to inspect get_network_info transaction: {}", e)))?;
+
+        // Parse the results from the inspection
+        let res = match inspect_result.effects.status() {
+            SuiExecutionStatus::Success => Ok(()),
+            SuiExecutionStatus::Failure {error: e} => {
+                // Check if the error is due to network not found
+                if e.contains("E_NETWORK_NOT_FOUND") || e.contains("NETWORK_NOT_FOUND") {
+                    tracing::info!("Network '{}' not found on blockchain", name);
+                    return Ok(None);
+                }
+                tracing::error!("contract error: {}", e);
+                return Err(ChainOperationError::DevInspectTransactionBlockFailed(format!("Failed to dev_inspect_transaction_block: {}", e)));
+            }
+        };
+
+        if res.is_err() {
+            return Err(res.unwrap_err());
+        }
+
+        if let Some(results) = inspect_result.results {
+            for result in results.iter() {
+                match self.parse_network_info_tuple(&result.return_values, name) {
+                    Ok(Some(network_details)) => {
+                        tracing::info!("Successfully retrieved network '{}' from contract", name);
+                        return Ok(Some(network_details));
+                    }
+                    Ok(None) => {
+                        tracing::info!("Network '{}' not found in parsed results", name);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse network info for '{}': {}", name, e);
+                        return Err(ChainOperationError::ResultParseError(format!("Failed to parse network info result: {}", e)));
+                    }
+                }
+            }
+        }
+        
+        tracing::info!("Network '{}' not found on blockchain", name);
         Ok(None)
     }
 
