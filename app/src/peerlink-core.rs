@@ -145,13 +145,6 @@ struct NetworkOptions {
     network_name: Option<String>,
 
     #[arg(
-        long,
-        env = "PL_NETWORK_SECRET",
-        help = t!("core_clap.network_secret").to_string(),
-    )]
-    network_secret: Option<String>,
-
-    #[arg(
         short,
         long,
         env = "PL_IPV4",
@@ -686,11 +679,12 @@ impl NetworkOptions {
 
         let old_ns = cfg.get_network_identity();
         let network_name = self.network_name.clone().unwrap_or(old_ns.network_name);
-        let network_secret = self
-            .network_secret
-            .clone()
-            .unwrap_or(old_ns.network_secret.unwrap_or_default());
-        cfg.set_network_identity(NetworkIdentity::new(network_name, network_secret));
+        // Note: network_secret is now fetched from Sui contract, not from CLI/config
+        cfg.set_network_identity(NetworkIdentity {
+            network_name,
+            network_secret: None, // Will be fetched from contract when needed
+            network_secret_digest: None, // Will be generated when secret is fetched
+        });
 
         if let Some(dhcp) = self.dhcp {
             cfg.set_dhcp(dhcp);
@@ -956,6 +950,39 @@ impl NetworkOptions {
         cfg.set_stun_servers_v6(self.stun_servers_v6.clone());
         Ok(())
     }
+
+    /// Fetch network secret from contract and update the network identity
+    async fn fetch_and_set_network_secret(&self, cfg: &mut TomlConfigLoader) -> anyhow::Result<()> {
+        let network_identity = cfg.get_network_identity();
+        
+        if network_identity.network_name.is_empty() {
+            return Err(anyhow::anyhow!("Network name is required to fetch secret from contract"));
+        }
+
+        tracing::info!("Fetching network secret for '{}' from Sui contract", network_identity.network_name);
+        
+        // Fetch network secret from contract
+        let network_secret_bytes = peerlink::common::config::fetch_network_secret_from_contract(&network_identity.network_name)
+            .await
+            .with_context(|| format!("Failed to fetch network secret for '{}' from contract", network_identity.network_name))?;
+        
+        let network_secret = String::from_utf8_lossy(&network_secret_bytes).to_string();
+        
+        // Generate digest from the fetched secret
+        let mut network_secret_digest = [0u8; 32];
+        peerlink::tunnel::generate_digest_from_str(&network_identity.network_name, &network_secret, &mut network_secret_digest);
+        
+        // Update the network identity with the fetched secret
+        let network_name_clone = network_identity.network_name.clone();
+        cfg.set_network_identity(NetworkIdentity {
+            network_name: network_identity.network_name,
+            network_secret: Some(network_secret),
+            network_secret_digest: Some(network_secret_digest),
+        });
+
+        tracing::info!("Successfully fetched and set network secret for network '{}'", network_name_clone);
+        Ok(())
+    }
 }
 
 impl LoggingConfigLoader for &LoggingOptions {
@@ -1172,6 +1199,12 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
                 cli.network_options.merge_into(&mut cfg).with_context(|| {
                     format!("failed to merge config from cli: {:?}", config_file)
                 })?;
+                
+                // Fetch network secret from contract after merging config
+                cli.network_options.fetch_and_set_network_secret(&mut cfg).await.with_context(|| {
+                    format!("failed to fetch network secret from contract for config file: {:?}", config_file)
+                })?;
+                
                 crate_cli_network = false;
             }
 
@@ -1191,6 +1224,12 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         cli.network_options
             .merge_into(&mut cfg)
             .with_context(|| "failed to create config from cli".to_string())?;
+        
+        // Fetch network secret from contract after merging CLI config
+        cli.network_options.fetch_and_set_network_secret(&mut cfg).await.with_context(|| {
+            "failed to fetch network secret from contract for CLI config".to_string()
+        })?;
+        
         println!("Starting peerlink from cli with config:");
         println!("############### TOML ###############\n");
         println!("{}", cfg.dump());

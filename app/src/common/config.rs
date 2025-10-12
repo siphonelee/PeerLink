@@ -11,12 +11,76 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     common::stun::StunInfoCollector,
+    chain_op::{sui::SuiChainOperator, ChainOperationInterface},
     proto::{
         acl::Acl,
         common::{CompressionAlgoPb, PortForwardConfigPb, SocketType},
     },
     tunnel::generate_digest_from_str,
 };
+
+/// Load Sui configuration from environment variables
+pub fn load_sui_config() -> anyhow::Result<SuiConfig> {
+    // Try to load from .sui.env file first
+    if let Err(_) = dotenvy::from_filename(".sui.env") {
+        // If .sui.env doesn't exist, try to load from system environment
+        dotenvy::dotenv().ok();
+    }
+    
+    let private_key = std::env::var("SUI_PRIVATE_KEY")
+        .with_context(|| "SUI_PRIVATE_KEY not found in environment. Please set it in .sui.env file")?;
+    let package_id = std::env::var("SUI_PACKAGE_ID")
+        .with_context(|| "SUI_PACKAGE_ID not found in environment. Please set it in .sui.env file")?;
+    let registry_id = std::env::var("SUI_REGISTRY_ID")
+        .with_context(|| "SUI_REGISTRY_ID not found in environment. Please set it in .sui.env file")?;
+    let registry_version: u64 = std::env::var("SUI_REGISTRY_VERSION")
+        .with_context(|| "SUI_REGISTRY_VERSION not found in environment. Please set it in .sui.env file")?
+        .parse()
+        .with_context(|| "SUI_REGISTRY_VERSION must be a valid u64 number")?;
+    let registry_digest = std::env::var("SUI_REGISTRY_DIGEST")
+        .with_context(|| "SUI_REGISTRY_DIGEST not found in environment. Please set it in .sui.env file")?;
+    
+    Ok(SuiConfig {
+        private_key,
+        package_id,
+        registry_id,
+        registry_version,
+        registry_digest,
+    })
+}
+
+#[derive(Clone)]
+pub struct SuiConfig {
+    pub private_key: String,
+    pub package_id: String,
+    pub registry_id: String,
+    pub registry_version: u64,
+    pub registry_digest: String,
+}
+
+/// Fetch network secret from Sui contract
+pub async fn fetch_network_secret_from_contract(network_name: &str) -> anyhow::Result<Vec<u8>> {
+    let sui_config = load_sui_config()
+        .with_context(|| "Failed to load Sui configuration")?;
+    
+    let chain_op = SuiChainOperator::new(
+        sui_config.private_key,
+        sui_config.package_id,
+        sui_config.registry_version,
+        sui_config.registry_digest,
+        sui_config.registry_id,
+    );
+    
+    chain_op.get_network_secret(network_name)
+        .await
+        .with_context(|| format!("Failed to fetch network secret for '{}' from contract", network_name))
+}
+
+/// Fetch network secret as string from Sui contract
+pub async fn fetch_network_secret_string_from_contract(network_name: &str) -> anyhow::Result<String> {
+    let secret_bytes = fetch_network_secret_from_contract(network_name).await?;
+    Ok(String::from_utf8_lossy(&secret_bytes).to_string())
+}
 
 pub type Flags = crate::proto::common::FlagsInConfig;
 
@@ -277,7 +341,16 @@ impl std::hash::Hash for NetworkIdentity {
 }
 
 impl NetworkIdentity {
-    pub fn new(network_name: String, network_secret: String) -> Self {
+    pub fn new(network_name: String) -> Self {
+        NetworkIdentity {
+            network_name,
+            network_secret: None, // Will be fetched from contract when needed
+            network_secret_digest: None, // Will be generated when secret is fetched
+        }
+    }
+    
+    /// Create NetworkIdentity with secret (for backwards compatibility)
+    pub fn new_with_secret(network_name: String, network_secret: String) -> Self {
         let mut network_secret_digest = [0u8; 32];
         generate_digest_from_str(&network_name, &network_secret, &mut network_secret_digest);
 
@@ -291,7 +364,7 @@ impl NetworkIdentity {
 
 impl Default for NetworkIdentity {
     fn default() -> Self {
-        Self::new("default".to_string(), "".to_string())
+        Self::new("default".to_string())
     }
 }
 
@@ -442,10 +515,7 @@ impl TomlConfigLoader {
         };
 
         let old_ns = config.get_network_identity();
-        config.set_network_identity(NetworkIdentity::new(
-            old_ns.network_name,
-            old_ns.network_secret.unwrap_or_default(),
-        ));
+        config.set_network_identity(NetworkIdentity::new(old_ns.network_name));
 
         Ok(config)
     }

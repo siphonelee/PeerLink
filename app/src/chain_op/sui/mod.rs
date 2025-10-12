@@ -482,10 +482,6 @@ impl ChainOperationInterface for SuiChainOperator {
             return Err(ChainOperationError::InvalidNetworkName(name));
         }
         
-        if secret.len() < 8 {
-            return Err(ChainOperationError::InvalidSecret("Secret must be at least 8 characters".to_string()));
-        }
-
         // Parse object IDs to validate them
         let package_object_id = ObjectID::from_str(&self.package_id)
             .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid package ID: {}", e)))?;

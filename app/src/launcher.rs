@@ -533,10 +533,12 @@ impl NetworkConfig {
         cfg.set_hostname(self.hostname.clone());
         cfg.set_dhcp(self.dhcp.unwrap_or_default());
         cfg.set_inst_name(self.network_name.clone().unwrap_or_default());
-        cfg.set_network_identity(NetworkIdentity::new(
-            self.network_name.clone().unwrap_or_default(),
-            self.network_secret.clone().unwrap_or_default(),
-        ));
+        // Create NetworkIdentity without network_secret since it will be fetched from contract
+        cfg.set_network_identity(NetworkIdentity {
+            network_name: self.network_name.clone().unwrap_or_default(),
+            network_secret: None, // Will be fetched from contract when needed
+            network_secret_digest: None, // Will be generated when secret is fetched
+        });
 
         if !cfg.get_dhcp() {
             let virtual_ipv4 = self.virtual_ipv4.clone().unwrap_or_default();
@@ -832,7 +834,8 @@ impl NetworkConfig {
 
         let network_identity = config.get_network_identity();
         result.network_name = Some(network_identity.network_name.clone());
-        result.network_secret = network_identity.network_secret.clone();
+        // Note: network_secret is not included in launcher config since it's fetched from contract
+        result.network_secret = None;
 
         if let Some(ipv4) = config.get_ipv4() {
             result.virtual_ipv4 = Some(ipv4.address().to_string());

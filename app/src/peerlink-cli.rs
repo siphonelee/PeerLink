@@ -24,7 +24,7 @@ use tokio::time::timeout;
 
 use peerlink::{
     chain_op::{sui::SuiChainOperator, ChainOperationInterface}, common::{
-        config::PortForwardConfig,
+        config::{PortForwardConfig, load_sui_config},
         constants::PEERLINK_VERSION,
         stun::{StunInfoCollector, StunInfoCollectorTrait},
     }, peers, proto::{
@@ -48,45 +48,6 @@ use peerlink::{
         rpc_types::controller::BaseController,
     }, tunnel::tcp::TcpTunnelConnector, utils::{cost_to_str, PeerRoutePair}
 };
-
-// Load Sui configuration from environment variables
-fn load_sui_config() -> Result<SuiConfig, Error> {
-    // Try to load from .sui.env file first
-    if let Err(_) = dotenvy::from_filename(".sui.env") {
-        // If .sui.env doesn't exist, try to load from system environment
-        dotenvy::dotenv().ok();
-    }
-    
-    let private_key = std::env::var("SUI_PRIVATE_KEY")
-        .with_context(|| "SUI_PRIVATE_KEY not found in environment. Please set it in .sui.env file")?;
-    let package_id = std::env::var("SUI_PACKAGE_ID")
-        .with_context(|| "SUI_PACKAGE_ID not found in environment. Please set it in .sui.env file")?;
-    let registry_id = std::env::var("SUI_REGISTRY_ID")
-        .with_context(|| "SUI_REGISTRY_ID not found in environment. Please set it in .sui.env file")?;
-    let registry_version: u64 = std::env::var("SUI_REGISTRY_VERSION")
-        .with_context(|| "SUI_REGISTRY_VERSION not found in environment. Please set it in .sui.env file")?
-        .parse()
-        .with_context(|| "SUI_REGISTRY_VERSION must be a valid u64 number")?;
-    let registry_digest = std::env::var("SUI_REGISTRY_DIGEST")
-        .with_context(|| "SUI_REGISTRY_DIGEST not found in environment. Please set it in .sui.env file")?;
-    
-    Ok(SuiConfig {
-        private_key,
-        package_id,
-        registry_id,
-        registry_version,
-        registry_digest,
-    })
-}
-
-#[derive(Clone)]
-struct SuiConfig {
-    private_key: String,
-    package_id: String,
-    registry_id: String,
-    registry_version: u64,
-    registry_digest: String,
-}
 
 rust_i18n::i18n!("locales", fallback = "en");
 
@@ -1397,11 +1358,7 @@ impl CommandHandler<'_> {
         if name.is_empty() {
             return Err(anyhow::anyhow!("Network name cannot be empty"));
         }
-        
-        if secret.len() < 8 {
-            return Err(anyhow::anyhow!("Secret must be at least 8 characters long"));
-        }
-        
+                
         let sui_config = load_sui_config()?;
         let chain_op = SuiChainOperator::new(
             sui_config.private_key,
