@@ -241,6 +241,11 @@ enum NetworkSubCommand {
         #[arg(help = "Network description", short = 'd', long = "description")]
         description: Option<String>,
     },
+    /// Get network secret (for authorized users)
+    Secret {
+        #[arg(help = "Network name")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1445,6 +1450,59 @@ impl CommandHandler<'_> {
         
         Ok(())
     }
+
+    async fn handle_network_secret(&self, name: &str) -> Result<(), Error> {
+        tracing::info!("Getting network secret for '{}'", name);
+        
+        // Validate input
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("Network name cannot be empty"));
+        }
+        
+        let sui_config = load_sui_config()?;
+        let chain_op = SuiChainOperator::new(
+            sui_config.private_key,
+            sui_config.package_id,
+            sui_config.registry_version,
+            sui_config.registry_digest,
+            sui_config.registry_id,
+        );
+        
+        match chain_op.get_network_secret(name).await {
+            Ok(secret_bytes) => {
+                if self.output_format == &OutputFormat::Json {
+                    let result = serde_json::json!({
+                        "success": true,
+                        "network_name": name,
+                        "secret": String::from_utf8_lossy(&secret_bytes),
+                        "secret_length": secret_bytes.len()
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("Network Secret for '{}':", name);
+                    println!("=================={}=", "=".repeat(name.len()));
+                    println!("Secret: {}", String::from_utf8_lossy(&secret_bytes));
+                    println!("Length: {} bytes", secret_bytes.len());
+                    println!();
+                }
+            }
+            Err(e) => {
+                if self.output_format == &OutputFormat::Json {
+                    let error_result = serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                        "network_name": name
+                    });
+                    println!("{}", serde_json::to_string_pretty(&error_result)?);
+                } else {
+                    eprintln!("Failed to get secret for network '{}': {}", name, e);
+                }
+                return Err(e.into());
+            }
+        }
+        
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1807,6 +1865,9 @@ async fn main() -> Result<(), Error> {
                 }
                 Some(NetworkSubCommand::Create { name, secret, description }) => {
                     handler.handle_network_create(name, secret, description).await?;
+                }
+                Some(NetworkSubCommand::Secret { name }) => {
+                    handler.handle_network_secret(&name).await?;
                 }
             }
         }

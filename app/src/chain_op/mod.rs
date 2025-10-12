@@ -198,6 +198,15 @@ pub trait ChainOperationInterface: Send + Sync {
     /// # Returns
     /// * `ChainResult<TransactionResponse>` - Transaction details if successful
     async fn update_exit_node_status(&self, network_name: &str, peer_id: PeerId, is_active: bool) -> ChainResult<TransactionResponse>;
+
+    /// Get network secret for authorized access
+    /// 
+    /// # Arguments
+    /// * `network_name` - The name of the network
+    /// 
+    /// # Returns
+    /// * `ChainResult<Vec<u8>>` - Network secret as bytes if authorized
+    async fn get_network_secret(&self, network_name: &str) -> ChainResult<Vec<u8>>;
 }
 
 /// Type alias for boxed chain operation interface
@@ -359,6 +368,15 @@ impl ChainOperationInterface for MockChainOperation {
             } else {
                 Err(ChainOperationError::Other(format!("Exit node with peer_id {} not found", peer_id)))
             }
+        } else {
+            Err(ChainOperationError::Other(format!("Network '{}' not found", network_name)))
+        }
+    }
+
+    async fn get_network_secret(&self, network_name: &str) -> ChainResult<Vec<u8>> {
+        let networks = self.networks.lock().unwrap();
+        if let Some(network) = networks.get(network_name) {
+            Ok(network.secret.as_bytes().to_vec())
         } else {
             Err(ChainOperationError::Other(format!("Network '{}' not found", network_name)))
         }

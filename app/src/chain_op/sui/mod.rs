@@ -307,7 +307,7 @@ impl SuiChainOperator {
 
     /// Parse network info from a tuple returned by get_network_info Move function
     /// The tuple format is: (String, address, u64, bool, String, u64, u64)
-    /// which corresponds to: (name, admin, created_at, is_active, description, max_peers)
+    /// which corresponds to: (name, admin, created_at, is_active, description, max_peers, total_exit_nodes)
     fn parse_network_info_tuple(&self, ret_values: &Vec<(Vec<u8>, SuiTypeTag)>, expected_name: &str) -> Result<Option<NetworkDetails>, Box<dyn std::error::Error>> {
         if ret_values.is_empty() {
             return Ok(None);
@@ -424,6 +424,51 @@ impl SuiChainOperator {
         };
         
         Ok(Some(network_details))
+    }
+
+    /// Parse network secret from BCS-encoded bytes returned by get_network_secret
+    /// The function returns vector<u8> which is BCS-encoded
+    fn parse_network_secret(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if data.is_empty() {
+            return Err("Empty data - no network secret found".into());
+        }
+        
+        // Debug: Print both hex and ASCII representation of the data
+        let hex_data = data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+        let ascii_data = data.iter()
+            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+            .collect::<String>();
+        
+        tracing::debug!("Parsing network secret, data length: {} bytes", data.len());
+        tracing::debug!("Hex: {}", hex_data);
+        tracing::debug!("ASCII: {}", ascii_data);
+        
+        // Parse BCS-encoded vector<u8>
+        // The data starts with the vector length (variable-length encoding for small vectors)
+        let mut offset = 0;
+        
+        if data.len() < 1 {
+            return Err("Insufficient data for vector length".into());
+        }
+        
+        // Read vector length (first byte for small vectors in BCS encoding)
+        let vector_len = data[offset] as usize;
+        offset += 1;
+        
+        if vector_len > 10000 {
+            return Err(format!("Vector length {} seems unreasonably large", vector_len).into());
+        }
+        
+        if offset + vector_len > data.len() {
+            return Err(format!("Insufficient data for vector: need {} bytes at offset {}, but only {} bytes available", vector_len, offset, data.len()).into());
+        }
+        
+        // Extract the secret bytes
+        let secret = data[offset..offset + vector_len].to_vec();
+        
+        tracing::debug!("Successfully parsed network secret with {} bytes", secret.len());
+        
+        Ok(secret)
     }
 }
 
@@ -894,6 +939,126 @@ impl ChainOperationInterface for SuiChainOperator {
             gas_used: Some(2500),
             success: true,
         })
+    }
+
+    async fn get_network_secret(&self, network_name: &str) -> ChainResult<Vec<u8>> {
+        // Validate input
+        if network_name.is_empty() {
+            return Err(ChainOperationError::InvalidNetworkName(network_name.to_string()));
+        }
+        
+        // Connect to Sui testnet
+        let sui_client = SuiClientBuilder::default()
+            .build_testnet()
+            .await
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Failed to connect to Sui testnet: {}", e)))?;
+        
+        // Parse object IDs to validate them
+        let package_object_id = ObjectID::from_str(&self.package_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid package ID: {}", e)))?;
+        let registry_object_id = ObjectID::from_str(&self.registry_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid registry ID: {}", e)))?;
+        
+        // Call get_network_secret() Move function using inspect_transaction_block
+        // This is a read-only call that doesn't require gas or signatures
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        
+        // Add registry object as shared object for the read call
+        let registry_arg = CallArg::Object(ObjectArg::SharedObject {
+            id: registry_object_id,
+            initial_shared_version: SequenceNumber::from(self.registry_version),
+            mutable: false, // Read-only access for getting network secret
+        });
+        
+        // Add network name argument with proper BCS encoding
+        let network_name_arg = CallArg::Pure(bcs::to_bytes(&network_name.to_string())
+            .map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize network name: {}", e)))?);
+        
+        // Build the Move call to get_network_secret function
+        let result = ptb.move_call(
+            package_object_id,
+            "peerlink".parse().unwrap(),
+            "get_network_secret".parse().unwrap(),
+            vec![], // No type arguments
+            vec![registry_arg, network_name_arg],
+        );
+        
+        if let Err(e) = result {
+            return Err(ChainOperationError::TransactionFailed(format!("Failed to build get_network_secret call: {:?}", e)));
+        }
+        
+        let programmable_transaction = ptb.finish();
+        
+        // Use a dummy sender address for read-only inspection
+        let (sui, sender) = self.setup_for_read().await
+                                    .map_err(|e| ChainOperationError::SetupReadFailed(format!("Sui Client setup for reading failed: {}", e)))?;
+        
+        let gas_budget = 10_000_000;
+        let gas_price = sui.read_api().get_reference_gas_price().await
+            .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to get Sui gas price: {:?}", e)))?;
+
+        // Build transaction data for inspection (read-only, no execution)
+        let tx_data = TransactionData::new_programmable(
+            sender,
+            vec![], // No gas coins needed for inspection
+            programmable_transaction,
+            gas_budget,
+            gas_price
+        );
+                
+        // Use dev_inspect_transaction_block for read-only execution
+        let inspect_result = sui_client
+            .read_api()
+            .dev_inspect_transaction_block(
+                sender,
+                tx_data.kind().clone(),
+                Some(gas_price.into()),
+                None, // No specific epoch
+                None, // No additional options
+            )
+            .await
+            .map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to inspect get_network_secret transaction: {}", e)))?;
+
+        // Parse the results from the inspection
+        let res = match inspect_result.effects.status() {
+            SuiExecutionStatus::Success => Ok(()),
+            SuiExecutionStatus::Failure {error: e} => {
+                tracing::error!("contract error: {}", e);
+                return Err(ChainOperationError::DevInspectTransactionBlockFailed(format!("Failed to dev_inspect_transaction_block: {}", e)));
+            }
+        };
+
+        if res.is_err() {
+            return Err(res.unwrap_err());
+        }
+
+        if let Some(results) = inspect_result.results {
+            for result in results.iter() {
+                for return_value in result.return_values.iter() {
+                    // Handle empty return values
+                    if return_value.0.is_empty() {
+                        tracing::info!("Empty return value - network '{}' secret not found", network_name);
+                        continue;
+                    }
+                    
+                    // Parse the network secret from the vector<u8> returned by get_network_secret
+                    // The function returns vector<u8> which is BCS-encoded
+                    match self.parse_network_secret(&return_value.0) {
+                        Ok(secret) => {
+                            tracing::info!("Successfully retrieved network secret for '{}'", network_name);
+                            return Ok(secret);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse network secret for '{}': {}", network_name, e);
+                            return Err(ChainOperationError::ResultParseError(format!("Failed to parse network secret result: {}", e)));
+                        }
+                    }
+                }
+            }
+        }
+        
+        tracing::info!("Network secret for '{}' not found on blockchain", network_name);
+        Err(ChainOperationError::Other(format!("Network secret for '{}' not found", network_name)))
     }
 }
 

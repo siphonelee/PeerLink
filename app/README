@@ -46,23 +46,21 @@ Before using the network management features, you need to configure your Sui blo
 
 List all networks:
 ```bash
-./target/debug/peerlink-cli network list
+peerlink-cli network list
 ```
 
 Create a new network:
 ```bash
-./target/debug/peerlink-cli network create <name> <secret> -d "<description>"
+peerlink-cli network create <name> <secret> -d "<description>"
 ```
 
 Get network information:
 ```bash
-./target/debug/peerlink-cli network info <name>
+peerlink-cli network info <name>
 ```
 
-### Output Formats
-
-Use `-o json` for JSON output:
+Get network secret (for authorized users):
 ```bash
-./target/debug/peerlink-cli -o json network list
+peerlink-cli network secret <name>
 ```
 
