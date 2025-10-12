@@ -207,6 +207,16 @@ enum NetworkSubCommand {
         #[arg(help = "Network name")]
         name: String,
     },
+    /// Deactivate a network (admin only)
+    Deactivate {
+        #[arg(help = "Network name")]
+        name: String,
+    },
+    /// Reactivate a network (admin only)
+    Reactivate {
+        #[arg(help = "Network name")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1460,6 +1470,112 @@ impl CommandHandler<'_> {
         
         Ok(())
     }
+
+    async fn handle_network_deactivate(&self, name: &str) -> Result<(), Error> {
+        tracing::info!("Deactivating network '{}'", name);
+        
+        // Validate input
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("Network name cannot be empty"));
+        }
+        
+        let sui_config = load_sui_config()?;
+        let chain_op = SuiChainOperator::new(
+            sui_config.private_key,
+            sui_config.package_id,
+            sui_config.registry_version,
+            sui_config.registry_digest,
+            sui_config.registry_id,
+        );
+        
+        match chain_op.deactivate_network(name).await {
+            Ok(response) => {
+                if self.output_format == &OutputFormat::Json {
+                    let result = serde_json::json!({
+                        "success": true,
+                        "network_name": name,
+                        "transaction_id": response.transaction_id,
+                        "gas_used": response.gas_used
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("Successfully deactivated network '{}'", name);
+                    println!("Transaction ID: {}", response.transaction_id);
+                    if let Some(gas_used) = response.gas_used {
+                        println!("Gas used: {}", gas_used);
+                    }
+                }
+            }
+            Err(e) => {
+                if self.output_format == &OutputFormat::Json {
+                    let error_result = serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                        "network_name": name
+                    });
+                    println!("{}", serde_json::to_string_pretty(&error_result)?);
+                } else {
+                    eprintln!("Failed to deactivate network '{}': {}", name, e);
+                }
+                return Err(e.into());
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn handle_network_reactivate(&self, name: &str) -> Result<(), Error> {
+        tracing::info!("Reactivating network '{}'", name);
+        
+        // Validate input
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("Network name cannot be empty"));
+        }
+        
+        let sui_config = load_sui_config()?;
+        let chain_op = SuiChainOperator::new(
+            sui_config.private_key,
+            sui_config.package_id,
+            sui_config.registry_version,
+            sui_config.registry_digest,
+            sui_config.registry_id,
+        );
+        
+        match chain_op.reactivate_network(name).await {
+            Ok(response) => {
+                if self.output_format == &OutputFormat::Json {
+                    let result = serde_json::json!({
+                        "success": true,
+                        "network_name": name,
+                        "transaction_id": response.transaction_id,
+                        "gas_used": response.gas_used
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("Successfully reactivated network '{}'", name);
+                    println!("Transaction ID: {}", response.transaction_id);
+                    if let Some(gas_used) = response.gas_used {
+                        println!("Gas used: {}", gas_used);
+                    }
+                }
+            }
+            Err(e) => {
+                if self.output_format == &OutputFormat::Json {
+                    let error_result = serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                        "network_name": name
+                    });
+                    println!("{}", serde_json::to_string_pretty(&error_result)?);
+                } else {
+                    eprintln!("Failed to reactivate network '{}': {}", name, e);
+                }
+                return Err(e.into());
+            }
+        }
+        
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1825,6 +1941,12 @@ async fn main() -> Result<(), Error> {
                 }
                 Some(NetworkSubCommand::Secret { name }) => {
                     handler.handle_network_secret(&name).await?;
+                }
+                Some(NetworkSubCommand::Deactivate { name }) => {
+                    handler.handle_network_deactivate(&name).await?;
+                }
+                Some(NetworkSubCommand::Reactivate { name }) => {
+                    handler.handle_network_reactivate(&name).await?;
                 }
             }
         }

@@ -831,39 +831,211 @@ impl ChainOperationInterface for SuiChainOperator {
     async fn deactivate_network(&self, name: &str) -> ChainResult<TransactionResponse> {
         tracing::info!("Deactivating network '{}' on Sui blockchain", name);
         
-        // Connect to Sui testnet
-        let _sui_client = SuiClientBuilder::default()
-            .build_testnet()
+        // Validate input
+        if name.is_empty() {
+            return Err(ChainOperationError::InvalidNetworkName(name.to_string()));
+        }
+
+        // Parse object IDs to validate them
+        let package_object_id = ObjectID::from_str(&self.package_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid package ID: {}", e)))?;
+        let registry_object_id = ObjectID::from_str(&self.registry_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid registry ID: {}", e)))?;
+
+        // 1) get the Sui client, the sender and recipient that we will use
+        // for the transaction, and find the coin we use as gas 
+        let (sui, sender, _recipient, coin) = self.setup_for_write().await
+                                    .map_err(|e| ChainOperationError::SetupWriteFailed(format!("Sui Client setup for writing failed: {}", e)))?;
+
+        // create a programmable transaction builder to add commands and create a PTB
+        let mut ptb = ProgrammableTransactionBuilder::new();
+
+        // Add pure arguments for the function call with proper BCS encoding
+        let network_name_arg = CallArg::Pure(bcs::to_bytes(&name.to_string()).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize network name: {}", e)))?);
+        
+        // Add registry object as shared object (first argument)
+        let registry_arg = CallArg::Object(ObjectArg::SharedObject {
+            id: registry_object_id,
+            initial_shared_version: SequenceNumber::from(self.registry_version),
+            mutable: true, // Registry needs to be mutable for deactivating networks
+        });
+                
+        // Build the Move call to deactivate_network function
+        ptb.move_call(
+            package_object_id,
+            "peerlink".parse().unwrap(),
+            "deactivate_network".parse().unwrap(),
+            vec![], // No type arguments
+            vec![
+                registry_arg,
+                network_name_arg,
+            ],
+        ).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to build Move call: {:?}", e)))?;
+
+        let programmable_transaction = ptb.finish();
+
+        let gas_budget = 10_000_000;
+        let gas_price = sui.read_api().get_reference_gas_price().await
+            .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to get Sui gas price: {:?}", e)))?;
+
+        // create the transaction data that will be sent to the network
+        let tx_data = TransactionData::new_programmable(
+            sender,
+            vec![coin.object_ref()],
+            programmable_transaction,
+            gas_budget,
+            gas_price,
+        );
+
+        // sign transaction
+        let keystore_path = sui_config_dir()
+                    .map_err(|e| ChainOperationError::SuiConfigDirError(format!("Failed to get Sui config dir: {:?}", e)))?
+                    .join(SUI_KEYSTORE_FILENAME);
+        let keystore = FileBasedKeystore::load_or_create(&keystore_path)
+                .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to load keystore: {:?}", e)))?;
+        let signature = keystore.sign_secure(&sender, &tx_data, Intent::sui_transaction())
+                .await
+                .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to sign Sui transaction: {:?}", e)))?;
+
+        // execute the transaction
+        let transaction_response = sui
+            .quorum_driver_api()
+            .execute_transaction_block(
+                Transaction::from_data(tx_data, vec![signature]),
+                SuiTransactionBlockResponseOptions::full_content(),
+                Some(ExecuteTransactionRequestType::WaitForLocalExecution),
+            )
             .await
-            .map_err(|e| ChainOperationError::ConnectionError(format!("Failed to connect to Sui testnet: {}", e)))?;
-        
-        // TODO: Implement actual deactivation transaction
-        
-        Ok(TransactionResponse {
-            transaction_id: format!("sui_deactivate_tx_{}", uuid::Uuid::new_v4()),
-            block_height: None,
-            gas_used: Some(3000),
-            success: true,
-        })
+            .map_err(|e| ChainOperationError::ExecuteTransactionBlockFailed(format!("Failed to execute_transaction_block: {}", e)))?;
+
+        let res: Result<(), ChainOperationError> = match transaction_response.effects.unwrap() {
+            SuiTransactionBlockEffects::V1(t) => {
+                match t.status {
+                    SuiExecutionStatus::Success => Ok(()),
+                    SuiExecutionStatus::Failure {error: e} => {
+                        tracing::error!("contract error: {}", e);
+                        return Err(ChainOperationError::ExecuteTransactionBlockFailed(format!("Failed to execute_transaction_block: {}", e)));
+                    }
+                }
+            }
+        };
+                
+        if res.is_ok() {
+            // Return the successful transaction response
+            Ok(TransactionResponse {
+                transaction_id: transaction_response.digest.to_string(),
+                block_height: None, // Sui uses epochs instead of block heights
+                gas_used: Some(self.get_total_balance_change(&transaction_response.balance_changes).await),
+                success: true,
+            })
+        } else {
+            Err(res.unwrap_err())
+        }
     }
 
     async fn reactivate_network(&self, name: &str) -> ChainResult<TransactionResponse> {
         tracing::info!("Reactivating network '{}' on Sui blockchain", name);
         
-        // Connect to Sui testnet
-        let _sui_client = SuiClientBuilder::default()
-            .build_testnet()
+        // Validate input
+        if name.is_empty() {
+            return Err(ChainOperationError::InvalidNetworkName(name.to_string()));
+        }
+
+        // Parse object IDs to validate them
+        let package_object_id = ObjectID::from_str(&self.package_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid package ID: {}", e)))?;
+        let registry_object_id = ObjectID::from_str(&self.registry_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid registry ID: {}", e)))?;
+
+        // 1) get the Sui client, the sender and recipient that we will use
+        // for the transaction, and find the coin we use as gas 
+        let (sui, sender, _recipient, coin) = self.setup_for_write().await
+                                    .map_err(|e| ChainOperationError::SetupWriteFailed(format!("Sui Client setup for writing failed: {}", e)))?;
+
+        // create a programmable transaction builder to add commands and create a PTB
+        let mut ptb = ProgrammableTransactionBuilder::new();
+
+        // Add pure arguments for the function call with proper BCS encoding
+        let network_name_arg = CallArg::Pure(bcs::to_bytes(&name.to_string()).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize network name: {}", e)))?);
+        
+        // Add registry object as shared object (first argument)
+        let registry_arg = CallArg::Object(ObjectArg::SharedObject {
+            id: registry_object_id,
+            initial_shared_version: SequenceNumber::from(self.registry_version),
+            mutable: true, // Registry needs to be mutable for reactivating networks
+        });
+                
+        // Build the Move call to reactivate_network function
+        ptb.move_call(
+            package_object_id,
+            "peerlink".parse().unwrap(),
+            "reactivate_network".parse().unwrap(),
+            vec![], // No type arguments
+            vec![
+                registry_arg,
+                network_name_arg,
+            ],
+        ).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to build Move call: {:?}", e)))?;
+
+        let programmable_transaction = ptb.finish();
+
+        let gas_budget = 10_000_000;
+        let gas_price = sui.read_api().get_reference_gas_price().await
+            .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to get Sui gas price: {:?}", e)))?;
+
+        // create the transaction data that will be sent to the network
+        let tx_data = TransactionData::new_programmable(
+            sender,
+            vec![coin.object_ref()],
+            programmable_transaction,
+            gas_budget,
+            gas_price,
+        );
+
+        // sign transaction
+        let keystore_path = sui_config_dir()
+                    .map_err(|e| ChainOperationError::SuiConfigDirError(format!("Failed to get Sui config dir: {:?}", e)))?
+                    .join(SUI_KEYSTORE_FILENAME);
+        let keystore = FileBasedKeystore::load_or_create(&keystore_path)
+                .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to load keystore: {:?}", e)))?;
+        let signature = keystore.sign_secure(&sender, &tx_data, Intent::sui_transaction())
+                .await
+                .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to sign Sui transaction: {:?}", e)))?;
+
+        // execute the transaction
+        let transaction_response = sui
+            .quorum_driver_api()
+            .execute_transaction_block(
+                Transaction::from_data(tx_data, vec![signature]),
+                SuiTransactionBlockResponseOptions::full_content(),
+                Some(ExecuteTransactionRequestType::WaitForLocalExecution),
+            )
             .await
-            .map_err(|e| ChainOperationError::ConnectionError(format!("Failed to connect to Sui testnet: {}", e)))?;
-        
-        // TODO: Implement actual reactivation transaction
-        
-        Ok(TransactionResponse {
-            transaction_id: format!("sui_reactivate_tx_{}", uuid::Uuid::new_v4()),
-            block_height: None,
-            gas_used: Some(3000),
-            success: true,
-        })
+            .map_err(|e| ChainOperationError::ExecuteTransactionBlockFailed(format!("Failed to execute_transaction_block: {}", e)))?;
+
+        let res: Result<(), ChainOperationError> = match transaction_response.effects.unwrap() {
+            SuiTransactionBlockEffects::V1(t) => {
+                match t.status {
+                    SuiExecutionStatus::Success => Ok(()),
+                    SuiExecutionStatus::Failure {error: e} => {
+                        tracing::error!("contract error: {}", e);
+                        return Err(ChainOperationError::ExecuteTransactionBlockFailed(format!("Failed to execute_transaction_block: {}", e)));
+                    }
+                }
+            }
+        };
+                
+        if res.is_ok() {
+            // Return the successful transaction response
+            Ok(TransactionResponse {
+                transaction_id: transaction_response.digest.to_string(),
+                block_height: None, // Sui uses epochs instead of block heights
+                gas_used: Some(self.get_total_balance_change(&transaction_response.balance_changes).await),
+                success: true,
+            })
+        } else {
+            Err(res.unwrap_err())
+        }
     }
 
     async fn add_exit_node(&self, network_name: &str, exit_node: ExitNodeInfo) -> ChainResult<TransactionResponse> {
