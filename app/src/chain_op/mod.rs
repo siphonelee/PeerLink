@@ -94,8 +94,7 @@ pub struct NetworkDetails {
 #[derive(Debug, Clone)]
 pub struct ExitNodeInfo {
     pub peer_id: PeerId,
-    pub ipv4_addr: String,
-    pub ipv6_addr: String,
+    pub connector_uri_list: Vec<String>,
     pub hostname: String,
     pub is_active: bool,
     pub registered_at: u64,
@@ -187,6 +186,15 @@ pub trait ChainOperationInterface: Send + Sync {
     /// # Returns
     /// * `ChainResult<Vec<ExitNodeInfo>>` - List of active exit nodes
     async fn get_exit_nodes(&self, network_name: &str) -> ChainResult<Vec<ExitNodeInfo>>;
+
+    /// Pick a random exit node from a network
+    /// 
+    /// # Arguments
+    /// * `network_name` - The name of the network
+    /// 
+    /// # Returns
+    /// * `ChainResult<Option<ExitNodeInfo>>` - Selected exit node if any available
+    async fn pick_exit_node(&self, network_name: &str) -> ChainResult<Option<ExitNodeInfo>>;
 
     /// Update exit node status
     /// 
@@ -351,6 +359,20 @@ impl ChainOperationInterface for MockChainOperation {
             Ok(network.exit_nodes.iter().filter(|node| node.is_active).cloned().collect())
         } else {
             Err(ChainOperationError::Other(format!("Network '{}' not found", network_name)))
+        }
+    }
+
+    async fn pick_exit_node(&self, network_name: &str) -> ChainResult<Option<ExitNodeInfo>> {
+        let exit_nodes = self.get_exit_nodes(network_name).await?;
+        if exit_nodes.is_empty() {
+            Ok(None)
+        } else {
+            // Simple mock random selection using current timestamp
+            let index = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() % exit_nodes.len() as u128) as usize;
+            Ok(Some(exit_nodes[index].clone()))
         }
     }
 

@@ -1041,20 +1041,126 @@ impl ChainOperationInterface for SuiChainOperator {
     async fn add_exit_node(&self, network_name: &str, exit_node: ExitNodeInfo) -> ChainResult<TransactionResponse> {
         tracing::info!("Adding exit node {} to network '{}' on Sui blockchain", exit_node.peer_id, network_name);
         
-        // Connect to Sui testnet
-        let _sui_client = SuiClientBuilder::default()
-            .build_testnet()
+        // Validate inputs
+        if network_name.is_empty() {
+            return Err(ChainOperationError::InvalidNetworkName(network_name.to_string()));
+        }
+
+        // Parse object IDs to validate them
+        let package_object_id = ObjectID::from_str(&self.package_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid package ID: {}", e)))?;
+        let registry_object_id = ObjectID::from_str(&self.registry_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid registry ID: {}", e)))?;
+
+        // Get the Sui client, sender and coin for the transaction
+        let (sui, sender, _recipient, coin) = self.setup_for_write().await
+                                    .map_err(|e| ChainOperationError::SetupWriteFailed(format!("Sui Client setup for writing failed: {}", e)))?;
+
+        // Create a programmable transaction builder
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        
+        // If no valid addresses, return error
+        if exit_node.connector_uri_list.is_empty() {
+            return Err(ChainOperationError::TransactionFailed("No valid connector uri addresses provided for exit node".to_string()));
+        }
+
+        // Add pure arguments for the function call with proper BCS encoding
+        let network_name_arg = CallArg::Pure(bcs::to_bytes(&network_name.to_string()).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize network name: {}", e)))?);
+        let peer_id_arg = CallArg::Pure(bcs::to_bytes(&exit_node.peer_id).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize peer_id: {}", e)))?);
+        let connector_uri_list_arg = CallArg::Pure(bcs::to_bytes(&exit_node.connector_uri_list).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize connector_uri_list: {}", e)))?);
+        let hostname_arg = CallArg::Pure(bcs::to_bytes(&exit_node.hostname).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize hostname: {}", e)))?);
+        
+        // Add clock object (0x6 is the well-known clock object ID on Sui)
+        let clock_object_id = ObjectID::from_str("0x0000000000000000000000000000000000000000000000000000000000000006")
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid clock object ID: {}", e)))?;
+        let clock_arg = CallArg::Object(ObjectArg::SharedObject{
+            id: clock_object_id,
+            initial_shared_version: SequenceNumber::from(1),
+            mutable: false,
+        });
+            
+        // Add registry object as shared object (first argument)
+        let registry_arg = CallArg::Object(ObjectArg::SharedObject {
+            id: registry_object_id,
+            initial_shared_version: SequenceNumber::from(self.registry_version),
+            mutable: true, // Registry needs to be mutable for adding exit nodes
+        });
+                
+        // Build the Move call to add_exit_node function
+        ptb.move_call(
+            package_object_id,
+            "peerlink".parse().unwrap(),
+            "add_exit_node".parse().unwrap(),
+            vec![], // No type arguments
+            vec![
+                registry_arg,
+                network_name_arg,
+                peer_id_arg,
+                connector_uri_list_arg,
+                hostname_arg,
+                clock_arg,
+            ],
+        ).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to build Move call: {:?}", e)))?;
+
+        let programmable_transaction = ptb.finish();
+
+        let gas_budget = 10_000_000;
+        let gas_price = sui.read_api().get_reference_gas_price().await
+            .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to get Sui gas price: {:?}", e)))?;
+
+        // Create the transaction data that will be sent to the network
+        let tx_data = TransactionData::new_programmable(
+            sender,
+            vec![coin.object_ref()],
+            programmable_transaction,
+            gas_budget,
+            gas_price,
+        );
+
+        // Sign transaction
+        let keystore_path = sui_config_dir()
+                    .map_err(|e| ChainOperationError::SuiConfigDirError(format!("Failed to get Sui config dir: {:?}", e)))?
+                    .join(SUI_KEYSTORE_FILENAME);
+        let keystore = FileBasedKeystore::load_or_create(&keystore_path)
+                .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to load keystore: {:?}", e)))?;
+        let signature = keystore.sign_secure(&sender, &tx_data, Intent::sui_transaction())
+                .await
+                .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to sign Sui transaction: {:?}", e)))?;
+
+        // Execute the transaction
+        let transaction_response = sui
+            .quorum_driver_api()
+            .execute_transaction_block(
+                Transaction::from_data(tx_data, vec![signature]),
+                SuiTransactionBlockResponseOptions::full_content(),
+                Some(ExecuteTransactionRequestType::WaitForLocalExecution),
+            )
             .await
-            .map_err(|e| ChainOperationError::ConnectionError(format!("Failed to connect to Sui testnet: {}", e)))?;
-        
-        // TODO: Implement actual add_exit_node transaction
-        
-        Ok(TransactionResponse {
-            transaction_id: format!("sui_add_exit_node_tx_{}", uuid::Uuid::new_v4()),
-            block_height: None,
-            gas_used: Some(4000),
-            success: true,
-        })
+            .map_err(|e| ChainOperationError::ExecuteTransactionBlockFailed(format!("Failed to execute_transaction_block: {}", e)))?;
+
+        let res: Result<(), ChainOperationError> = match transaction_response.effects.unwrap() {
+            SuiTransactionBlockEffects::V1(t) => {
+                match t.status {
+                    SuiExecutionStatus::Success => Ok(()),
+                    SuiExecutionStatus::Failure {error: e} => {
+                        tracing::error!("contract error: {}", e);
+                        return Err(ChainOperationError::ExecuteTransactionBlockFailed(format!("Failed to execute_transaction_block: {}", e)));
+                    }
+                }
+            }
+        };
+                
+        if res.is_ok() {
+            // Return the successful transaction response
+            Ok(TransactionResponse {
+                transaction_id: transaction_response.digest.to_string(),
+                block_height: None, // Sui uses epochs instead of block heights
+                gas_used: Some(self.get_total_balance_change(&transaction_response.balance_changes).await),
+                success: true,
+            })
+        } else {
+            Err(res.unwrap_err())
+        }
     }
 
     async fn remove_exit_node(&self, network_name: &str, peer_id: PeerId) -> ChainResult<TransactionResponse> {
@@ -1088,6 +1194,126 @@ impl ChainOperationInterface for SuiChainOperator {
         // TODO: Implement actual exit node retrieval
         
         Ok(vec![])
+    }
+
+    async fn pick_exit_node(&self, network_name: &str) -> ChainResult<Option<ExitNodeInfo>> {
+        tracing::info!("Picking random exit node for network '{}' from Sui blockchain", network_name);
+        
+        // Validate inputs
+        if network_name.is_empty() {
+            return Err(ChainOperationError::InvalidNetworkName(network_name.to_string()));
+        }
+
+        // Parse object IDs to validate them
+        let package_object_id = ObjectID::from_str(&self.package_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid package ID: {}", e)))?;
+        let registry_object_id = ObjectID::from_str(&self.registry_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid registry ID: {}", e)))?;
+
+        // Get the Sui client for reading
+        let (sui, sender) = self.setup_for_read().await
+                                    .map_err(|e| ChainOperationError::SetupReadFailed(format!("Sui Client setup for reading failed: {}", e)))?;
+
+        // Create a programmable transaction builder for the read call
+        let mut ptb = ProgrammableTransactionBuilder::new();
+
+        // Add pure arguments for the function call with proper BCS encoding
+        let network_name_arg = CallArg::Pure(bcs::to_bytes(&network_name.to_string()).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize network name: {}", e)))?);
+        
+        // Add clock object (0x6 is the well-known clock object ID on Sui)
+        let clock_object_id = ObjectID::from_str("0x0000000000000000000000000000000000000000000000000000000000000006")
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid clock object ID: {}", e)))?;
+        let clock_arg = CallArg::Object(ObjectArg::SharedObject{
+            id: clock_object_id,
+            initial_shared_version: SequenceNumber::from(1),
+            mutable: false,
+        });
+            
+        // Add registry object as shared object (first argument)
+        let registry_arg = CallArg::Object(ObjectArg::SharedObject {
+            id: registry_object_id,
+            initial_shared_version: SequenceNumber::from(self.registry_version),
+            mutable: false, // Read-only access for selection
+        });
+                
+        // Build the Move call to pick_exit_node function
+        let _pick_call = ptb.move_call(
+            package_object_id,
+            "peerlink".parse().unwrap(),
+            "pick_exit_node".parse().unwrap(),
+            vec![], // No type arguments
+            vec![
+                registry_arg,
+                network_name_arg,
+                clock_arg,
+            ],
+        ).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to build Move call: {:?}", e)))?;
+
+        let programmable_transaction = ptb.finish();
+
+        // Use dev_inspect to call the read-only function
+        let tx_data = TransactionData::new_programmable(
+            SuiAddress::ZERO, // Dummy sender for dev_inspect
+            vec![], // No gas objects needed for dev_inspect
+            programmable_transaction,
+            0, // No gas budget needed for dev_inspect
+            1, // Minimal gas price for dev_inspect
+        );
+
+        // Execute the dev_inspect call
+        let gas_price = sui.read_api().get_reference_gas_price().await
+            .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to get Sui gas price: {:?}", e)))?;
+
+        let dev_inspect_response = sui
+            .read_api()
+            .dev_inspect_transaction_block(
+                sender,
+                tx_data.kind().clone(),
+                Some(gas_price.into()),
+                None, // No specific epoch
+                None, // No additional options
+            )
+            .await
+            .map_err(|e| ChainOperationError::DevInspectTransactionBlockFailed(format!("Failed to dev_inspect pick_exit_node: {}", e)))?;
+
+        // Check if the call was successful
+        if let Some(error) = dev_inspect_response.error {
+            tracing::error!("pick_exit_node dev_inspect failed: {}", error);
+            return Err(ChainOperationError::DevInspectTransactionBlockFailed(format!("pick_exit_node failed: {}", error)));
+        }
+
+        // Parse the return value
+        if let Some(results) = dev_inspect_response.results {
+            if !results.is_empty() {
+                let return_values = &results[0].return_values;
+                if !return_values.is_empty() {
+                    // The return value should be Option<ExitNodeInfo>
+                    let return_value = &return_values[0];
+                    
+                    // Deserialize the BCS-encoded return value
+                    // Move contract returns Option<ExitNodeInfo> with full struct:
+                    // (peer_id: u32, connector_uri_list: vector<String>, hostname: String, is_active: bool, registered_at: u64)
+                    let option_exit_node: Option<(u32, Vec<String>, String, bool, u64)> = bcs::from_bytes(&return_value.0)
+                        .map_err(|e| ChainOperationError::ResultParseError(format!("Failed to deserialize exit node result: {}", e)))?;
+                    
+                    if let Some((peer_id, connector_uri_list, hostname, is_active, registered_at)) = option_exit_node {
+                            return Ok(Some(ExitNodeInfo {
+                                peer_id,
+                                connector_uri_list,
+                                hostname,
+                                is_active,
+                                registered_at,
+                            }));
+                        } else {
+                            // No exit node selected (empty network or no active nodes)
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        
+        // Default case: no exit node found
+        Ok(None)
     }
 
     async fn update_exit_node_status(&self, network_name: &str, peer_id: PeerId, is_active: bool) -> ChainResult<TransactionResponse> {
