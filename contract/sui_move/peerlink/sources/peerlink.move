@@ -9,6 +9,7 @@ use std::string::{Self, String};
 use std::vector;
 use sui::clock::{Self, Clock};
 use sui::event;
+use std::option::{Self, Option};
 
 /// Error codes
 const E_NETWORK_NOT_FOUND: u64 = 1;
@@ -23,10 +24,8 @@ const E_PEER_NOT_FOUND: u64 = 7;
 public struct ExitNodeInfo has copy, drop, store {
     /// Exit node peer ID
     peer_id: u32,
-    /// IPv4 address of the exit node
-    ipv4_addr: String,
-    /// IPv6 address of the exit node (optional)
-    ipv6_addr: String,
+    /// List of connector URIs for this exit node
+    connector_uri_list: vector<String>,
     /// Hostname for the exit node
     hostname: String,
     /// Whether this exit node is currently active
@@ -182,8 +181,7 @@ public entry fun add_exit_node(
     registry: &mut NetworkRegistry,
     network_name: String,
     peer_id: u32,
-    ipv4_addr: String,
-    ipv6_addr: String,
+    connector_uri_list: vector<String>,
     hostname: String,
     clock: &Clock,
     ctx: &mut TxContext
@@ -198,8 +196,7 @@ public entry fun add_exit_node(
     
     let exit_node_info = ExitNodeInfo {
         peer_id,
-        ipv4_addr,
-        ipv6_addr,
+        connector_uri_list,
         hostname,
         is_active: true,
         registered_at: current_time,
@@ -266,6 +263,56 @@ public fun get_exit_nodes(
     };
     
     result
+}
+
+/// Randomly select an active exit node from a network
+public fun pick_exit_node(
+    registry: &NetworkRegistry,
+    network_name: String,
+    ctx: &TxContext
+): Option<ExitNodeInfo> {
+    assert!(table::contains(&registry.networks, network_name), E_NETWORK_NOT_FOUND);
+    
+    let network_info = table::borrow(&registry.networks, network_name);
+    let mut active_exit_nodes = vector::empty<ExitNodeInfo>();
+    let mut i = 0;
+    let len = vector::length(&network_info.exit_node_peer_ids);
+    
+    // Collect all active exit nodes
+    while (i < len) {
+        let peer_id = *vector::borrow(&network_info.exit_node_peer_ids, i);
+        let exit_node = table::borrow(&network_info.exit_nodes, peer_id);
+        
+        if (exit_node.is_active) {
+            vector::push_back(&mut active_exit_nodes, *exit_node);
+        };
+        
+        i = i + 1;
+    };
+    
+    let active_count = vector::length(&active_exit_nodes);
+    if (active_count == 0) {
+        return option::none<ExitNodeInfo>()
+    };
+    
+    // Use transaction context for pseudo-randomness
+    let tx_hash = tx_context::digest(ctx);
+    let random_bytes = std::hash::sha3_256(*tx_hash);
+    
+    // Use first few bytes to create a simple random number
+    let mut random_value: u64 = 0;
+    if (vector::length(&random_bytes) > 0) {
+        random_value = (*vector::borrow(&random_bytes, 0) as u64);
+        if (vector::length(&random_bytes) > 1) {
+            random_value = random_value * 256 + (*vector::borrow(&random_bytes, 1) as u64);
+        };
+        if (vector::length(&random_bytes) > 2) {
+            random_value = random_value * 256 + (*vector::borrow(&random_bytes, 2) as u64);
+        };
+    };
+    
+    let selected_index = random_value % active_count;
+    option::some(*vector::borrow(&active_exit_nodes, selected_index))
 }
 
 
