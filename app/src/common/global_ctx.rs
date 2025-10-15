@@ -140,6 +140,7 @@ impl GlobalCtx {
             ..Default::default()
         };
 
+        // TODO calvin: put more items
         GlobalCtx {
             inst_name: config_fs.get_inst_name(),
             id,

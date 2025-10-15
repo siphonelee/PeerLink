@@ -222,6 +222,7 @@ impl PeerlinkLauncher {
             let my_peer_id = peer_mgr.my_peer_id();
             
             // TODO: calvin - Write info to contract, including my_peer_id
+            println!("Exit node enabled, registering to contract with peer id: {}", my_peer_id);
             tracing::info!(?my_peer_id, "Exit node enabled, registering to contract");
             // Add contract registration logic here
         }

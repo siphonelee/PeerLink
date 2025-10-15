@@ -226,6 +226,9 @@ pub trait ConfigLoader: Send + Sync {
     fn get_peers(&self) -> Vec<PeerConfig>;
     fn set_peers(&self, peers: Vec<PeerConfig>);
 
+    fn get_exit_connectors(&self) -> Vec<ExitConnectorConfig>;
+    fn set_exit_connectors(&self, exit_connectors: Vec<ExitConnectorConfig>);
+
     fn get_listeners(&self) -> Option<Vec<url::Url>>;
     fn set_listeners(&self, listeners: Vec<url::Url>);
 
@@ -374,6 +377,11 @@ pub struct PeerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ExitConnectorConfig {
+    pub uri: url::Url,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ProxyNetworkConfig {
     pub cidr: cidr::Ipv4Cidr,                // the CIDR of the proxy network
     pub mapped_cidr: Option<cidr::Ipv4Cidr>, // allow remap the proxy CIDR to another CIDR
@@ -466,6 +474,7 @@ struct Config {
     exit_nodes: Option<Vec<IpAddr>>,
 
     peer: Option<Vec<PeerConfig>>,
+    exit_connector: Option<Vec<ExitConnectorConfig>>,
     proxy_network: Option<Vec<ProxyNetworkConfig>>,
 
     rpc_portal: Option<SocketAddr>,
@@ -731,6 +740,14 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_peers(&self, peers: Vec<PeerConfig>) {
         self.config.lock().unwrap().peer = Some(peers);
+    }
+
+    fn get_exit_connectors(&self) -> Vec<ExitConnectorConfig> {
+        self.config.lock().unwrap().exit_connector.clone().unwrap_or_default()
+    }
+
+    fn set_exit_connectors(&self, exit_connectors: Vec<ExitConnectorConfig>) {
+        self.config.lock().unwrap().exit_connector = Some(exit_connectors);
     }
 
     fn get_listeners(&self) -> Option<Vec<url::Url>> {

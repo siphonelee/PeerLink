@@ -19,7 +19,7 @@ use peerlink::{
     common::{
         config::{
             get_avaliable_encrypt_methods, ConfigLoader, ConsoleLoggerConfig, FileLoggerConfig,
-            LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader,
+            LoggingConfigLoader, NetworkIdentity, PeerConfig, ExitConnectorConfig, PortForwardConfig, TomlConfigLoader,
             VpnPortalConfig,
         },
         constants::PEERLINK_VERSION,
@@ -178,6 +178,15 @@ struct NetworkOptions {
         num_args = 0..
     )]
     peers: Vec<String>,
+
+    #[arg(
+        long,
+        env = "PL_EXIT_CONNECTORS",
+        value_delimiter = ',',
+        help = t!("core_clap.exit_connectors").to_string(),
+        num_args = 0..
+    )]
+    exit_connectors: Vec<String>,
 
     #[arg(
         short,
@@ -715,6 +724,19 @@ impl NetworkOptions {
             cfg.set_peers(peers);
         }
 
+        if !self.exit_connectors.is_empty() {
+            let mut exit_connectors = cfg.get_exit_connectors();
+            exit_connectors.reserve(exit_connectors.len() + self.exit_connectors.len());
+            for p in &self.exit_connectors {
+                exit_connectors.push(ExitConnectorConfig {
+                    uri: p
+                        .parse()
+                        .with_context(|| format!("failed to parse exit connector uri: {}", p))?,
+                });
+            }
+            cfg.set_exit_connectors(exit_connectors);
+        }
+
         if self.no_listener || !self.listeners.is_empty() {
             cfg.set_listeners(
                 Cli::parse_listeners(self.no_listener, self.listeners.clone())?
@@ -1236,6 +1258,8 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         println!("-----------------------------------");
         manager.run_network_instance(cfg, ConfigSource::Cli)?;
     }
+
+    // TODO calvin: fetch exit nodes as peers here
 
     tokio::select! {
         _ = manager.wait() => {
