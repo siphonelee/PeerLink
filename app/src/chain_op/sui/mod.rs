@@ -1223,11 +1223,6 @@ impl ChainOperationInterface for SuiChainOperator {
         // Add clock object (0x6 is the well-known clock object ID on Sui)
         let clock_object_id = ObjectID::from_str("0x0000000000000000000000000000000000000000000000000000000000000006")
             .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid clock object ID: {}", e)))?;
-        let clock_arg = CallArg::Object(ObjectArg::SharedObject{
-            id: clock_object_id,
-            initial_shared_version: SequenceNumber::from(1),
-            mutable: false,
-        });
             
         // Add registry object as shared object (first argument)
         let registry_arg = CallArg::Object(ObjectArg::SharedObject {
@@ -1245,7 +1240,6 @@ impl ChainOperationInterface for SuiChainOperator {
             vec![
                 registry_arg,
                 network_name_arg,
-                clock_arg,
             ],
         ).map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to build Move call: {:?}", e)))?;
 

@@ -1,7 +1,10 @@
-use crate::common::config::PortForwardConfig;
+use crate::chain_op::sui::SuiChainOperator;
+use crate::chain_op::ChainOperationInterface;
+use crate::common::config::{load_sui_config, PortForwardConfig};
 use crate::proto::peer_rpc::RouteForeignNetworkSummary;
 use crate::proto::web;
 use crate::{
+    chain_op::ExitNodeInfo,
     common::{
         config::{
             gen_default_flags, ConfigLoader, NetworkIdentity, PeerConfig, TomlConfigLoader,
@@ -142,6 +145,9 @@ impl PeerlinkLauncher {
         fetch_node_info: bool,
     ) -> Result<(), anyhow::Error> {
         let exit_node_enabled = cfg.get_flags().enable_exit_node;
+        let network_identity = cfg.get_network_identity();
+        let exit_connector_configs = cfg.get_exit_connectors();
+
         let mut instance = Instance::new(cfg);
         let mut tasks = JoinSet::new();
 
@@ -220,11 +226,50 @@ impl PeerlinkLauncher {
         if exit_node_enabled {
             let peer_mgr = instance.get_peer_manager();
             let my_peer_id = peer_mgr.my_peer_id();
+            let global_ctx = instance.get_global_ctx();
             
-            // TODO: calvin - Write info to contract, including my_peer_id
-            println!("Exit node enabled, registering to contract with peer id: {}", my_peer_id);
-            tracing::info!(?my_peer_id, "Exit node enabled, registering to contract");
-            // Add contract registration logic here
+            println!("Exit node enabled, registering to contract. my_peer_id: {:?}", my_peer_id);
+            
+            // Spawn a task to register the exit node to the blockchain
+            let network_name = network_identity.network_name.clone();
+            // Create exit node info from current node configuration
+            let hostname = global_ctx.get_hostname();
+            
+            // Convert exit connector configs to URI list
+            let mut connector_uri_list = Vec::<String>::new();
+            for config in exit_connector_configs {
+                connector_uri_list.push(config.uri.to_string());
+            }
+
+            let exit_node_info = ExitNodeInfo {
+                peer_id: my_peer_id,
+                connector_uri_list,
+                hostname,
+                is_active: true,
+                registered_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            };
+                            
+
+            let sui_config = load_sui_config()?;
+            let chain_op = SuiChainOperator::new(
+                sui_config.private_key,
+                sui_config.package_id,
+                sui_config.registry_version,
+                sui_config.registry_digest,
+                sui_config.registry_id,
+            );
+            match chain_op.add_exit_node(&network_name, exit_node_info).await {
+                Ok(response) => {
+                    println!("Successfully registered exit node to contract: {:?}", response);
+                }
+                Err(e) => {
+                    println!("Failed to register exit node to contract: {:?}", e);
+                    return Err(e.into());
+                }
+            }
         }
 
         stop_signal.notified().await;
