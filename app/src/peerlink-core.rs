@@ -16,24 +16,15 @@ use cidr::IpCidr;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use peerlink::{
-    common::{
+    chain_op::{sui::SuiChainOperator, ChainOperationInterface}, common::{
         config::{
-            get_avaliable_encrypt_methods, ConfigLoader, ConsoleLoggerConfig, FileLoggerConfig,
-            LoggingConfigLoader, NetworkIdentity, PeerConfig, ExitConnectorConfig, PortForwardConfig, TomlConfigLoader,
-            VpnPortalConfig,
+            get_avaliable_encrypt_methods, load_sui_config, ConfigLoader, ConsoleLoggerConfig, ExitConnectorConfig, FileLoggerConfig, LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader, VpnPortalConfig
         },
         constants::PEERLINK_VERSION,
         global_ctx::GlobalCtx,
         set_default_machine_id,
         stun::MockStunInfoCollector,
-    },
-    connector::create_connector_by_url,
-    instance_manager::NetworkInstanceManager,
-    launcher::{add_proxy_network_to_config, ConfigSource},
-    proto::common::{CompressionAlgoPb, NatType},
-    tunnel::{IpVersion, PROTO_PORT_OFFSET},
-    utils::{init_logger, setup_panic_handler},
-    web_client,
+    }, connector::create_connector_by_url, instance_manager::NetworkInstanceManager, launcher::{add_proxy_network_to_config, ConfigSource}, proto::common::{CompressionAlgoPb, NatType}, tunnel::{IpVersion, PROTO_PORT_OFFSET}, utils::{init_logger, setup_panic_handler}, web_client
 };
 use tokio::io::AsyncReadExt;
 
@@ -1201,8 +1192,39 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         tokio::signal::ctrl_c().await.unwrap();
         return Ok(());
     }
+
+    // Fetch exit nodes from contract
+    let sui_config = load_sui_config()?;
+    let chain_op = SuiChainOperator::new(
+        sui_config.private_key,
+        sui_config.package_id,
+        sui_config.registry_version,
+        sui_config.registry_digest,
+        sui_config.registry_id,
+    );
+
+    let res = chain_op.pick_exit_node("calvin")
+                            .await
+                            .with_context(|| "Failed to pick exit node")?;
+    
+    let exit_node = res.ok_or_else(|| anyhow::anyhow!("No exit nodes available for the network"))?;    
+    println!("Picked exit node with uri list: {:#?}", exit_node.connector_uri_list);
+
+    // Helper function to merge exit node URIs into config peers
+    let add_exit_node_peers = |cfg: &mut TomlConfigLoader| -> anyhow::Result<()> {
+        let mut peers = cfg.get_peers();
+        for uri_str in &exit_node.connector_uri_list {
+            let uri = uri_str.parse::<url::Url>()
+                .with_context(|| format!("Failed to parse exit node URI: {}", uri_str))?;
+            peers.push(PeerConfig { uri });
+        }
+        cfg.set_peers(peers);
+        tracing::info!("Added {} exit node peers to config", exit_node.connector_uri_list.len());
+        Ok(())
+    };
+
     let manager = NetworkInstanceManager::new();
-    let mut crate_cli_network =
+    let mut create_cli_network =
         cli.config_file.is_none() || cli.network_options.network_name.is_some();
     if let Some(config_files) = cli.config_file {
         let config_file_count = config_files.len();
@@ -1227,8 +1249,13 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
                     format!("failed to fetch network secret from contract for config file: {:?}", config_file)
                 })?;
                 
-                crate_cli_network = false;
+                create_cli_network = false;
             }
+
+            // Add exit node peers to config
+            add_exit_node_peers(&mut cfg).with_context(|| {
+                format!("failed to add exit node peers to config file: {:?}", config_file)
+            })?;
 
             println!(
                 "Starting peerlink from config file {:?} with config:",
@@ -1241,7 +1268,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    if crate_cli_network {
+    if create_cli_network {
         let mut cfg = TomlConfigLoader::default();
         cli.network_options
             .merge_into(&mut cfg)
@@ -1252,14 +1279,17 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             "failed to fetch network secret from contract for CLI config".to_string()
         })?;
         
+        // Add exit node peers to CLI config
+        add_exit_node_peers(&mut cfg).with_context(|| {
+            "failed to add exit node peers to CLI config".to_string()
+        })?;
+        
         println!("Starting peerlink from cli with config:");
         println!("############### TOML ###############\n");
         println!("{}", cfg.dump());
         println!("-----------------------------------");
         manager.run_network_instance(cfg, ConfigSource::Cli)?;
     }
-
-    // TODO calvin: fetch exit nodes as peers here
 
     tokio::select! {
         _ = manager.wait() => {
