@@ -8,7 +8,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     process::ExitCode,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::Context;
@@ -27,6 +27,86 @@ use peerlink::{
     }, connector::create_connector_by_url, instance_manager::NetworkInstanceManager, launcher::{add_proxy_network_to_config, ConfigSource}, proto::common::{CompressionAlgoPb, NatType}, tunnel::{IpVersion, PROTO_PORT_OFFSET}, utils::{init_logger, setup_panic_handler}, web_client
 };
 use tokio::io::AsyncReadExt;
+
+// Global exit node registry for cleanup on exit
+#[derive(Debug, Clone)]
+struct ExitNodeCleanupInfo {
+    network_name: String,
+    peer_id: u32,
+    package_id: String,
+    registry_version: u64,
+    registry_digest: String,
+    registry_id: String,
+    private_key: String,
+}
+
+static EXIT_NODE_REGISTRY: Mutex<Vec<ExitNodeCleanupInfo>> = Mutex::new(Vec::new());
+
+/// Register an exit node for cleanup on application exit
+pub fn register_exit_node_for_cleanup(
+    network_name: String, 
+    peer_id: u32, 
+    package_id: String,
+    registry_version: u64,
+    registry_digest: String,
+    registry_id: String,
+    private_key: String
+) {
+    if let Ok(mut registry) = EXIT_NODE_REGISTRY.lock() {
+        let cleanup_info = ExitNodeCleanupInfo {
+            network_name: network_name.clone(),
+            peer_id,
+            package_id,
+            registry_version,
+            registry_digest,
+            registry_id,
+            private_key,
+        };
+        registry.push(cleanup_info);
+        tracing::info!("Registered exit node {} in network '{}' for cleanup on exit", peer_id, network_name);
+    }
+}
+
+/// Cleanup all registered exit nodes on application exit
+async fn cleanup_exit_nodes() {
+    let registered_nodes = {
+        if let Ok(mut registry) = EXIT_NODE_REGISTRY.lock() {
+            let nodes = registry.drain(..).collect::<Vec<_>>();
+            nodes
+        } else {
+            return;
+        }
+    };
+
+    if registered_nodes.is_empty() {
+        return;
+    }
+    
+    for cleanup_info in registered_nodes {
+        let chain_op = SuiChainOperator::new(
+            cleanup_info.private_key,
+            cleanup_info.package_id,
+            cleanup_info.registry_version,
+            cleanup_info.registry_digest,
+            cleanup_info.registry_id,
+        );
+        
+        match chain_op.remove_exit_node(&cleanup_info.network_name, cleanup_info.peer_id).await {
+            Ok(response) => {
+                println!("Successfully removed exit node {} from network '{}': {}", 
+                    cleanup_info.peer_id, cleanup_info.network_name, response.transaction_id);
+            }
+            Err(e) => {
+                eprintln!("Failed to remove exit node {} from network '{}': {:?}", 
+                    cleanup_info.peer_id, cleanup_info.network_name, e);
+            }
+        }
+    }
+    
+    println!("Exit node cleanup completed.");
+}
+
+
 
 #[cfg(target_os = "windows")]
 windows_service::define_windows_service!(ffi_service_main, win_service_main);
@@ -1196,11 +1276,11 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     // Fetch exit nodes from contract
     let sui_config = load_sui_config()?;
     let chain_op = SuiChainOperator::new(
-        sui_config.private_key,
-        sui_config.package_id,
+        sui_config.private_key.clone(),
+        sui_config.package_id.clone(),
         sui_config.registry_version,
-        sui_config.registry_digest,
-        sui_config.registry_id,
+        sui_config.registry_digest.clone(),
+        sui_config.registry_id.clone(),
     );
 
     // Helper function to merge exit node URIs into config peers
@@ -1252,6 +1332,17 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             
             println!("Picked exit node with uri list: {:#?}", exit_node.connector_uri_list);
 
+            // Register this exit node for cleanup (we'll use the picked exit node's peer_id)
+            register_exit_node_for_cleanup(
+                cfg.get_network_identity().network_name.clone(),
+                exit_node.peer_id,
+                sui_config.package_id.clone(),
+                sui_config.registry_version,
+                sui_config.registry_digest.clone(),
+                sui_config.registry_id.clone(),
+                sui_config.private_key.clone(),
+            );
+
             // Add exit node peers to config
             add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
                 format!("failed to add exit node peers to config file: {:?}", config_file)
@@ -1286,6 +1377,17 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         
         println!("Picked exit node with uri list: {:#?}", exit_node.connector_uri_list);
 
+        // Register this exit node for cleanup (we'll use the picked exit node's peer_id)
+        register_exit_node_for_cleanup(
+            cfg.get_network_identity().network_name.clone(),
+            exit_node.peer_id,
+            sui_config.package_id.clone(),
+            sui_config.registry_version,
+            sui_config.registry_digest.clone(),
+            sui_config.registry_id.clone(),
+            sui_config.private_key.clone(),
+        );
+
         // Add exit node peers to CLI config
         add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
             "failed to add exit node peers to CLI config".to_string()
@@ -1306,6 +1408,8 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
                 .filter_map(|info| info.error_msg)
                 .collect::<Vec<_>>();
             if !errs.is_empty() {
+                // Cleanup exit nodes before returning error
+                cleanup_exit_nodes().await;
                 return Err(anyhow::anyhow!("some instances stopped with errors"));
             }
         }
@@ -1313,6 +1417,9 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             println!("ctrl-c received, exiting...");
         }
     }
+    
+    // Cleanup exit nodes on any exit path
+    cleanup_exit_nodes().await;
     Ok(())
 }
 
@@ -1396,6 +1503,10 @@ async fn main() -> ExitCode {
     }
 
     println!("Stopping peerlink...");
+    
+    // Final cleanup of exit nodes before shutting down completely
+    // (This serves as a safety net in case cleanup wasn't called in run_main)
+    cleanup_exit_nodes().await;
 
     dump_profile(0);
     set_prof_active(false);
