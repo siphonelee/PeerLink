@@ -16,7 +16,7 @@ use cidr::IpCidr;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use peerlink::{
-    chain_op::{sui::SuiChainOperator, ChainOperationInterface}, common::{
+    chain_op::{sui::SuiChainOperator, ChainOperationInterface, ExitNodeInfo}, common::{
         config::{
             get_avaliable_encrypt_methods, load_sui_config, ConfigLoader, ConsoleLoggerConfig, ExitConnectorConfig, FileLoggerConfig, LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader, VpnPortalConfig
         },
@@ -1203,15 +1203,8 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         sui_config.registry_id,
     );
 
-    let res = chain_op.pick_exit_node("calvin")
-                            .await
-                            .with_context(|| "Failed to pick exit node")?;
-    
-    let exit_node = res.ok_or_else(|| anyhow::anyhow!("No exit nodes available for the network"))?;    
-    println!("Picked exit node with uri list: {:#?}", exit_node.connector_uri_list);
-
     // Helper function to merge exit node URIs into config peers
-    let add_exit_node_peers = |cfg: &mut TomlConfigLoader| -> anyhow::Result<()> {
+    let add_exit_node_peers = |cfg: &mut TomlConfigLoader, exit_node: ExitNodeInfo| -> anyhow::Result<()> {
         let mut peers = cfg.get_peers();
         for uri_str in &exit_node.connector_uri_list {
             let uri = uri_str.parse::<url::Url>()
@@ -1252,8 +1245,15 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
                 create_cli_network = false;
             }
 
+            let exit_node = chain_op.pick_exit_node(&cfg.get_network_identity().network_name)
+                                    .await
+                                    .with_context(|| "Failed to pick exit node")?
+                                    .ok_or_else(|| anyhow::anyhow!("No exit nodes available for the network"))?;
+            
+            println!("Picked exit node with uri list: {:#?}", exit_node.connector_uri_list);
+
             // Add exit node peers to config
-            add_exit_node_peers(&mut cfg).with_context(|| {
+            add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
                 format!("failed to add exit node peers to config file: {:?}", config_file)
             })?;
 
@@ -1279,8 +1279,15 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             "failed to fetch network secret from contract for CLI config".to_string()
         })?;
         
+        let exit_node = chain_op.pick_exit_node(&cfg.get_network_identity().network_name)
+                                .await
+                                .with_context(|| "Failed to pick exit node")?
+                                .ok_or_else(|| anyhow::anyhow!("No exit nodes available for the network"))?;
+        
+        println!("Picked exit node with uri list: {:#?}", exit_node.connector_uri_list);
+
         // Add exit node peers to CLI config
-        add_exit_node_peers(&mut cfg).with_context(|| {
+        add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
             "failed to add exit node peers to CLI config".to_string()
         })?;
         
