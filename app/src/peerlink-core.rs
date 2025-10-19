@@ -1254,10 +1254,18 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                     .with_context(|| "Failed to pick exit node")?
                                     .ok_or_else(|| anyhow::anyhow!("No exit nodes available for the network"))?;
             
-            // Add exit node peers to config
-            add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
-                format!("failed to add exit node peers to config file: {:?}", config_file)
-            })?;
+            // Check if this exit node is already in our exit connectors
+            let exit_connectors = cfg.get_exit_connectors();
+            let is_self_exit_node = cfg.get_flags().enable_exit_node && exit_node.connector_uri_list.iter().any(|exit_uri| {
+                exit_connectors.iter().any(|connector| connector.uri.to_string() == *exit_uri)
+            });
+            
+            // Add exit node peers to config only if it's not our own exit node
+            if !is_self_exit_node {
+                add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
+                    format!("failed to add exit node peers to config file: {:?}", config_file)
+                })?;
+            }
 
             println!(
                 "Starting peerlink from config file {:?} with config:",
@@ -1288,10 +1296,18 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         
         println!("Picked exit node with uri list: {:#?}", exit_node.connector_uri_list);
 
-        // Add exit node peers to CLI config
-        add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
-            "failed to add exit node peers to CLI config".to_string()
-        })?;
+        // Check if this exit node is already in our exit connectors
+        let exit_connectors = cfg.get_exit_connectors();
+        let is_self_exit_node = cfg.get_flags().enable_exit_node && exit_node.connector_uri_list.iter().any(|exit_uri| {
+            exit_connectors.iter().any(|connector| connector.uri.to_string() == *exit_uri)
+        });
+
+        // Add exit node peers to CLI config only if it's not our own exit node
+        if !is_self_exit_node {
+            add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
+                "failed to add exit node peers to CLI config".to_string()
+            })?;
+        }
         
         println!("Starting peerlink from cli with config:");
         println!("############### TOML ###############\n");
