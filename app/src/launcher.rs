@@ -1,5 +1,5 @@
 use crate::chain_op::sui::SuiChainOperator;
-use crate::chain_op::ChainOperationInterface;
+use crate::chain_op::{ChainOperationInterface, register_exit_node_for_cleanup};
 use crate::common::config::{load_sui_config, PortForwardConfig};
 use crate::proto::peer_rpc::RouteForeignNetworkSummary;
 use crate::proto::web;
@@ -255,15 +255,26 @@ impl PeerlinkLauncher {
 
             let sui_config = load_sui_config()?;
             let chain_op = SuiChainOperator::new(
-                sui_config.private_key,
-                sui_config.package_id,
+                sui_config.private_key.clone(),
+                sui_config.package_id.clone(),
                 sui_config.registry_version,
-                sui_config.registry_digest,
-                sui_config.registry_id,
+                sui_config.registry_digest.clone(),
+                sui_config.registry_id.clone(),
             );
             match chain_op.add_exit_node(&network_name, exit_node_info).await {
                 Ok(response) => {
                     println!("Successfully registered exit node to contract: {:?}", response);
+                    
+                    // Register exit node for cleanup on application exit
+                    register_exit_node_for_cleanup(
+                        network_name.clone(),
+                        my_peer_id,
+                        sui_config.package_id,
+                        sui_config.registry_version,
+                        sui_config.registry_digest,
+                        sui_config.registry_id,
+                        sui_config.private_key,
+                    );
                 }
                 Err(e) => {
                     println!("Failed to register exit node to contract: {:?}", e);

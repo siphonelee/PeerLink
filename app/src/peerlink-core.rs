@@ -16,7 +16,7 @@ use cidr::IpCidr;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use peerlink::{
-    chain_op::{sui::SuiChainOperator, ChainOperationInterface, ExitNodeInfo}, common::{
+    chain_op::{sui::SuiChainOperator, ChainOperationInterface, ExitNodeInfo, cleanup_exit_nodes}, common::{
         config::{
             get_avaliable_encrypt_methods, load_sui_config, ConfigLoader, ConsoleLoggerConfig, ExitConnectorConfig, FileLoggerConfig, LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader, VpnPortalConfig
         },
@@ -28,83 +28,7 @@ use peerlink::{
 };
 use tokio::io::AsyncReadExt;
 
-// Global exit node registry for cleanup on exit
-#[derive(Debug, Clone)]
-struct ExitNodeCleanupInfo {
-    network_name: String,
-    peer_id: u32,
-    package_id: String,
-    registry_version: u64,
-    registry_digest: String,
-    registry_id: String,
-    private_key: String,
-}
 
-static EXIT_NODE_REGISTRY: Mutex<Vec<ExitNodeCleanupInfo>> = Mutex::new(Vec::new());
-
-/// Register an exit node for cleanup on application exit
-pub fn register_exit_node_for_cleanup(
-    network_name: String, 
-    peer_id: u32, 
-    package_id: String,
-    registry_version: u64,
-    registry_digest: String,
-    registry_id: String,
-    private_key: String
-) {
-    if let Ok(mut registry) = EXIT_NODE_REGISTRY.lock() {
-        let cleanup_info = ExitNodeCleanupInfo {
-            network_name: network_name.clone(),
-            peer_id,
-            package_id,
-            registry_version,
-            registry_digest,
-            registry_id,
-            private_key,
-        };
-        registry.push(cleanup_info);
-        tracing::info!("Registered exit node {} in network '{}' for cleanup on exit", peer_id, network_name);
-    }
-}
-
-/// Cleanup all registered exit nodes on application exit
-async fn cleanup_exit_nodes() {
-    let registered_nodes = {
-        if let Ok(mut registry) = EXIT_NODE_REGISTRY.lock() {
-            let nodes = registry.drain(..).collect::<Vec<_>>();
-            nodes
-        } else {
-            return;
-        }
-    };
-
-    if registered_nodes.is_empty() {
-        return;
-    }
-    
-    for cleanup_info in registered_nodes {
-        let chain_op = SuiChainOperator::new(
-            cleanup_info.private_key,
-            cleanup_info.package_id,
-            cleanup_info.registry_version,
-            cleanup_info.registry_digest,
-            cleanup_info.registry_id,
-        );
-        
-        match chain_op.remove_exit_node(&cleanup_info.network_name, cleanup_info.peer_id).await {
-            Ok(response) => {
-                println!("Successfully removed exit node {} from network '{}': {}", 
-                    cleanup_info.peer_id, cleanup_info.network_name, response.transaction_id);
-            }
-            Err(e) => {
-                eprintln!("Failed to remove exit node {} from network '{}': {:?}", 
-                    cleanup_info.peer_id, cleanup_info.network_name, e);
-            }
-        }
-    }
-    
-    println!("Exit node cleanup completed.");
-}
 
 
 
@@ -1330,19 +1254,6 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                     .with_context(|| "Failed to pick exit node")?
                                     .ok_or_else(|| anyhow::anyhow!("No exit nodes available for the network"))?;
             
-            println!("Picked exit node with uri list: {:#?}", exit_node.connector_uri_list);
-
-            // Register this exit node for cleanup (we'll use the picked exit node's peer_id)
-            register_exit_node_for_cleanup(
-                cfg.get_network_identity().network_name.clone(),
-                exit_node.peer_id,
-                sui_config.package_id.clone(),
-                sui_config.registry_version,
-                sui_config.registry_digest.clone(),
-                sui_config.registry_id.clone(),
-                sui_config.private_key.clone(),
-            );
-
             // Add exit node peers to config
             add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
                 format!("failed to add exit node peers to config file: {:?}", config_file)
@@ -1376,17 +1287,6 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                 .ok_or_else(|| anyhow::anyhow!("No exit nodes available for the network"))?;
         
         println!("Picked exit node with uri list: {:#?}", exit_node.connector_uri_list);
-
-        // Register this exit node for cleanup (we'll use the picked exit node's peer_id)
-        register_exit_node_for_cleanup(
-            cfg.get_network_identity().network_name.clone(),
-            exit_node.peer_id,
-            sui_config.package_id.clone(),
-            sui_config.registry_version,
-            sui_config.registry_digest.clone(),
-            sui_config.registry_id.clone(),
-            sui_config.private_key.clone(),
-        );
 
         // Add exit node peers to CLI config
         add_exit_node_peers(&mut cfg, exit_node).with_context(|| {

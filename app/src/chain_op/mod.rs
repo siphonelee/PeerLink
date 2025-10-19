@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::common::PeerId;
 
@@ -406,3 +407,81 @@ impl ChainOperationInterface for MockChainOperation {
 }
 
 pub mod sui;
+
+// Global exit node registry for cleanup on exit
+#[derive(Debug, Clone)]
+struct ExitNodeCleanupInfo {
+    network_name: String,
+    peer_id: u32,
+    package_id: String,
+    registry_version: u64,
+    registry_digest: String,
+    registry_id: String,
+    private_key: String,
+}
+
+static EXIT_NODE_REGISTRY: Mutex<Vec<ExitNodeCleanupInfo>> = Mutex::new(Vec::new());
+
+/// Register an exit node for cleanup on application exit
+pub fn register_exit_node_for_cleanup(
+    network_name: String, 
+    peer_id: u32, 
+    package_id: String,
+    registry_version: u64,
+    registry_digest: String,
+    registry_id: String,
+    private_key: String
+) {
+    if let Ok(mut registry) = EXIT_NODE_REGISTRY.lock() {
+        let cleanup_info = ExitNodeCleanupInfo {
+            network_name: network_name.clone(),
+            peer_id,
+            package_id,
+            registry_version,
+            registry_digest,
+            registry_id,
+            private_key,
+        };
+        registry.push(cleanup_info);
+        tracing::info!("Registered exit node {} in network '{}' for cleanup on exit", peer_id, network_name);
+    }
+}
+
+/// Cleanup all registered exit nodes on application exit
+pub async fn cleanup_exit_nodes() {
+    let registered_nodes = {
+        if let Ok(mut registry) = EXIT_NODE_REGISTRY.lock() {
+            let nodes = registry.drain(..).collect::<Vec<_>>();
+            nodes
+        } else {
+            return;
+        }
+    };
+
+    if registered_nodes.is_empty() {
+        return;
+    }
+    
+    for cleanup_info in registered_nodes {
+        let chain_op = sui::SuiChainOperator::new(
+            cleanup_info.private_key,
+            cleanup_info.package_id,
+            cleanup_info.registry_version,
+            cleanup_info.registry_digest,
+            cleanup_info.registry_id,
+        );
+        
+        match chain_op.remove_exit_node(&cleanup_info.network_name, cleanup_info.peer_id).await {
+            Ok(response) => {
+                println!("Successfully removed exit node {} from network '{}': {}", 
+                    cleanup_info.peer_id, cleanup_info.network_name, response.transaction_id);
+            }
+            Err(e) => {
+                eprintln!("Failed to remove exit node {} from network '{}': {:?}", 
+                    cleanup_info.peer_id, cleanup_info.network_name, e);
+            }
+        }
+    }
+    
+    println!("Exit node cleanup completed.");
+}
