@@ -1736,8 +1736,6 @@ impl CommandHandler<'_> {
     }
 
     async fn handle_network_add_exit_node(&self, name: &str, peer_id: u32, hostname: &str, connector_uris: &str) -> Result<(), Error> {
-        tracing::info!("Adding exit node {} to network '{}'", peer_id, name);
-        
         // Validate inputs
         if name.is_empty() {
             return Err(anyhow::anyhow!("Network name cannot be empty"));

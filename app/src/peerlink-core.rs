@@ -1262,6 +1262,14 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             
             // Add exit node peers to config only if it's not our own exit node
             if !is_self_exit_node {
+                // Add exit node to fetched_exit_connectors
+                let fetched_exit_connectors: Vec<ExitConnectorConfig> = exit_node.connector_uri_list.iter()
+                    .filter_map(|uri_str| uri_str.parse::<url::Url>().ok())
+                    .map(|uri| ExitConnectorConfig { uri })
+                    .collect();
+                cfg.set_fetched_exit_connectors(fetched_exit_connectors);
+                cfg.set_fetched_exit_peer_id(Some(exit_node.peer_id));
+
                 add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
                     format!("failed to add exit node peers to config file: {:?}", config_file)
                 })?;
@@ -1304,6 +1312,14 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
 
         // Add exit node peers to CLI config only if it's not our own exit node
         if !is_self_exit_node {
+            // Add exit node to fetched_exit_connectors
+            let fetched_exit_connectors: Vec<ExitConnectorConfig> = exit_node.connector_uri_list.iter()
+                .filter_map(|uri_str| uri_str.parse::<url::Url>().ok())
+                .map(|uri| ExitConnectorConfig { uri })
+                .collect();
+            cfg.set_fetched_exit_connectors(fetched_exit_connectors);
+            cfg.set_fetched_exit_peer_id(Some(exit_node.peer_id));
+
             add_exit_node_peers(&mut cfg, exit_node).with_context(|| {
                 "failed to add exit node peers to CLI config".to_string()
             })?;

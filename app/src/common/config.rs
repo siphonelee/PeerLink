@@ -10,13 +10,10 @@ use cidr::IpCidr;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    common::stun::StunInfoCollector,
-    chain_op::{sui::SuiChainOperator, ChainOperationInterface},
-    proto::{
+    chain_op::{sui::SuiChainOperator, ChainOperationInterface}, common::{stun::StunInfoCollector, PeerId}, proto::{
         acl::Acl,
         common::{CompressionAlgoPb, PortForwardConfigPb, SocketType},
-    },
-    tunnel::generate_digest_from_str,
+    }, tunnel::generate_digest_from_str
 };
 
 /// Load Sui configuration from environment variables
@@ -228,6 +225,12 @@ pub trait ConfigLoader: Send + Sync {
 
     fn get_exit_connectors(&self) -> Vec<ExitConnectorConfig>;
     fn set_exit_connectors(&self, exit_connectors: Vec<ExitConnectorConfig>);
+
+    fn get_fetched_exit_connectors(&self) -> Vec<ExitConnectorConfig>;
+    fn set_fetched_exit_connectors(&self, fetched_exit_connectors: Vec<ExitConnectorConfig>);
+
+    fn get_fetched_exit_peer_id(&self) -> Option<PeerId>;
+    fn set_fetched_exit_peer_id(&self, peer_id: Option<PeerId>);
 
     fn get_listeners(&self) -> Option<Vec<url::Url>>;
     fn set_listeners(&self, listeners: Vec<url::Url>);
@@ -476,6 +479,10 @@ struct Config {
     peer: Option<Vec<PeerConfig>>,
     exit_connector: Option<Vec<ExitConnectorConfig>>,
     proxy_network: Option<Vec<ProxyNetworkConfig>>,
+
+    fetched_exit_peer_id: Option<PeerId>,
+    #[serde(default)]
+    fetched_exit_connectors: Vec<ExitConnectorConfig>,
 
     rpc_portal: Option<SocketAddr>,
     rpc_portal_whitelist: Option<Vec<IpCidr>>,
@@ -748,6 +755,22 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_exit_connectors(&self, exit_connectors: Vec<ExitConnectorConfig>) {
         self.config.lock().unwrap().exit_connector = Some(exit_connectors);
+    }
+
+    fn get_fetched_exit_connectors(&self) -> Vec<ExitConnectorConfig> {
+        self.config.lock().unwrap().fetched_exit_connectors.clone()
+    }
+
+    fn set_fetched_exit_connectors(&self, fetched_exit_connectors: Vec<ExitConnectorConfig>) {
+        self.config.lock().unwrap().fetched_exit_connectors = fetched_exit_connectors;
+    }
+
+    fn get_fetched_exit_peer_id(&self) -> Option<PeerId> {
+        self.config.lock().unwrap().fetched_exit_peer_id
+    }
+
+    fn set_fetched_exit_peer_id(&self, peer_id: Option<PeerId>) {
+        self.config.lock().unwrap().fetched_exit_peer_id = peer_id;
     }
 
     fn get_listeners(&self) -> Option<Vec<url::Url>> {

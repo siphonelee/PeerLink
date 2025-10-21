@@ -192,7 +192,7 @@ fn handle_event(
                         print_event(
                             instance_id,
                             format!(
-                                "new peer connection added. conn_info: {}",
+                                "🔗 New peer connection established: {}",
                                 peer_conn_info_to_string(p)
                             ),
                         );

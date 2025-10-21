@@ -457,6 +457,8 @@ impl SyncedRouteInfo {
                         .insert(route_info.peer_id, raw_route_info.clone());
                     route_info.clone()
                 });
+            
+
         }
         if need_inc_version {
             self.version.inc();
@@ -2139,6 +2141,12 @@ impl RouteSessionManager {
                 peer_infos,
                 raw_peer_infos.as_ref().unwrap(),
             )?;
+            
+            // Check if any of the updated peers are exit nodes and display their private IPs
+            for route_info in peer_infos {
+                Self::check_and_display_exit_node_ip(&service_impl.global_ctx, route_info);
+            }
+            
             service_impl
                 .synced_route_info
                 .verify_and_update_group_trusts(
@@ -2187,6 +2195,22 @@ impl RouteSessionManager {
             session_id,
             error: None,
         })
+    }
+    
+    fn check_and_display_exit_node_ip(global_ctx: &ArcGlobalCtx, route_info: &RoutePeerInfo) {
+        // Get exit node peer id from config
+        if let Some(exit_peer_id) = global_ctx.config.get_fetched_exit_peer_id() {
+            if route_info.peer_id == exit_peer_id {
+                if let Some(ipv4_addr) = route_info.ipv4_addr {
+                    println!(
+                        "🌐 EXIT NODE PRIVATE IP DISCOVERED! Peer ID: {}, Virtual IP: {}, Hostname: {}",
+                        route_info.peer_id,
+                        ipv4_addr,
+                        route_info.hostname.as_deref().unwrap_or("unknown")
+                    );
+                }
+            }
+        }
     }
 }
 
