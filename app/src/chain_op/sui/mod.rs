@@ -468,6 +468,140 @@ impl SuiChainOperator {
         
         Ok(secret)
     }
+
+    /// Parse exit nodes data from BCS-encoded bytes returned by get_exit_nodes
+    /// The function returns vector<ExitNodeInfo> which is BCS-encoded
+    /// Each ExitNodeInfo: (peer_id: u32, connector_uri_list: vector<String>, hostname: String, is_active: bool, registered_at: u64)
+    fn parse_exit_nodes_data(&self, data: &[u8]) -> Result<Vec<ExitNodeInfo>, Box<dyn std::error::Error>> {
+        let mut exit_nodes = Vec::new();
+        
+        // Handle empty data case - return empty vector instead of error
+        if data.is_empty() {
+            return Ok(exit_nodes);
+        }
+        
+        // If data is too short to contain a proper vector length (1 byte for small vectors),
+        // it's likely an empty vector or invalid data - return empty result
+        if data.len() < 1 {
+            return Ok(exit_nodes);
+        }
+        
+        // Read vector length (first byte for small vectors in BCS encoding)
+        let vector_len = data[0] as usize;
+        
+        let mut offset = 1; // Start after the vector length byte
+        for i in 0..vector_len {
+            if offset >= data.len() {
+                return Err(format!("Insufficient data for exit node {}: offset {} >= data length {}", i, offset, data.len()).into());
+            }
+            
+            match self.parse_single_exit_node(&data[offset..]) {
+                Ok((exit_node, bytes_consumed)) => {
+                    exit_nodes.push(exit_node);
+                    offset += bytes_consumed;
+                }
+                Err(e) => {
+                    return Err(format!("Failed to parse exit node {}: {}", i, e).into());
+                }
+            }
+        }
+        
+        Ok(exit_nodes)
+    }
+
+    /// Parse a single exit node from BCS data
+    /// Returns (ExitNodeInfo, bytes_consumed)
+    fn parse_single_exit_node(&self, data: &[u8]) -> Result<(ExitNodeInfo, usize), Box<dyn std::error::Error>> {
+        let mut offset = 0;
+        
+        // Parse peer_id (4 bytes u32)
+        if offset + 4 > data.len() {
+            return Err(format!("Insufficient data for peer_id: need 4 bytes at offset {}, but only {} bytes available", offset, data.len()).into());
+        }
+        let peer_id = u32::from_le_bytes([
+            data[offset], data[offset+1], data[offset+2], data[offset+3]
+        ]);
+        offset += 4;
+        
+        // Parse connector_uri_list (length + vector of strings)
+        if offset + 1 > data.len() {
+            return Err(format!("Insufficient data for connector_uri_list length: need 1 byte at offset {}, but only {} bytes available", offset, data.len()).into());
+        }
+        let uri_list_len = data[offset] as usize;
+        offset += 1;
+        
+        if uri_list_len > 1000 {
+            return Err(format!("Connector URI list length {} seems unreasonably large", uri_list_len).into());
+        }
+        
+        let mut connector_uri_list = Vec::new();
+        for _ in 0..uri_list_len {
+            // Parse each URI string (length + string)
+            if offset + 1 > data.len() {
+                return Err(format!("Insufficient data for URI string length: need 1 byte at offset {}, but only {} bytes available", offset, data.len()).into());
+            }
+            let uri_len = data[offset] as usize;
+            offset += 1;
+            
+            if uri_len > 1000 {
+                return Err(format!("URI length {} seems unreasonably large", uri_len).into());
+            }
+            
+            if offset + uri_len > data.len() {
+                return Err(format!("Insufficient data for URI string: need {} bytes at offset {}, but only {} bytes available", uri_len, offset, data.len()).into());
+            }
+            let uri = String::from_utf8(data[offset..offset + uri_len].to_vec())
+                .map_err(|e| format!("Failed to parse URI as UTF-8: {}", e))?;
+            offset += uri_len;
+            
+            connector_uri_list.push(uri);
+        }
+        
+        // Parse hostname (length + string)
+        if offset + 1 > data.len() {
+            return Err(format!("Insufficient data for hostname length: need 1 byte at offset {}, but only {} bytes available", offset, data.len()).into());
+        }
+        let hostname_len = data[offset] as usize;
+        offset += 1;
+        
+        if hostname_len > 1000 {
+            return Err(format!("Hostname length {} seems unreasonably large", hostname_len).into());
+        }
+        
+        if offset + hostname_len > data.len() {
+            return Err(format!("Insufficient data for hostname: need {} bytes at offset {}, but only {} bytes available", hostname_len, offset, data.len()).into());
+        }
+        let hostname = String::from_utf8(data[offset..offset + hostname_len].to_vec())
+            .map_err(|e| format!("Failed to parse hostname as UTF-8: {}", e))?;
+        offset += hostname_len;
+        
+        // Parse is_active (1 byte bool)
+        if offset + 1 > data.len() {
+            return Err(format!("Insufficient data for is_active: need 1 byte at offset {}, but only {} bytes available", offset, data.len()).into());
+        }
+        let is_active = data[offset] != 0;
+        offset += 1;
+        
+        // Parse registered_at (8 bytes u64)
+        if offset + 8 > data.len() {
+            return Err(format!("Insufficient data for registered_at: need 8 bytes at offset {}, but only {} bytes available", offset, data.len()).into());
+        }
+        let registered_at = u64::from_le_bytes([
+            data[offset], data[offset+1], data[offset+2], data[offset+3],
+            data[offset+4], data[offset+5], data[offset+6], data[offset+7]
+        ]);
+        offset += 8;
+        
+        let exit_node = ExitNodeInfo {
+            peer_id,
+            connector_uri_list,
+            hostname,
+            is_active,
+            registered_at,
+        };
+        
+        Ok((exit_node, offset))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1269,17 +1403,121 @@ impl ChainOperationInterface for SuiChainOperator {
     }
 
     async fn get_exit_nodes(&self, network_name: &str) -> ChainResult<Vec<ExitNodeInfo>> {
-        tracing::info!("Getting exit nodes for network '{}' from Sui blockchain", network_name);
+        if network_name.is_empty() {
+            return Err(ChainOperationError::InvalidNetworkName(network_name.to_string()));
+        }
         
-        // Connect to Sui testnet
-        let _sui_client = SuiClientBuilder::default()
+        let sui_client = SuiClientBuilder::default()
             .build_testnet()
             .await
             .map_err(|e| ChainOperationError::ConnectionError(format!("Failed to connect to Sui testnet: {}", e)))?;
         
-        // TODO: Implement actual exit node retrieval
+        let package_object_id = ObjectID::from_str(&self.package_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid package ID: {}", e)))?;
+        let registry_object_id = ObjectID::from_str(&self.registry_id)
+            .map_err(|e| ChainOperationError::ConnectionError(format!("Invalid registry ID: {}", e)))?;
         
-        Ok(vec![])
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        
+        // Add registry object as shared object for the read call
+        let registry_arg = CallArg::Object(ObjectArg::SharedObject {
+            id: registry_object_id,
+            initial_shared_version: SequenceNumber::from(self.registry_version),
+            mutable: false, // Read-only access for getting exit nodes
+        });
+        
+        // Add network name argument with proper BCS encoding
+        let network_name_arg = CallArg::Pure(bcs::to_bytes(&network_name.to_string())
+            .map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to serialize network name: {}", e)))?);
+        
+        // Build the Move call to get_exit_nodes function
+        let result = ptb.move_call(
+            package_object_id,
+            "peerlink".parse().unwrap(),
+            "get_exit_nodes".parse().unwrap(),
+            vec![], // No type arguments
+            vec![registry_arg, network_name_arg],
+        );
+        
+        if let Err(e) = result {
+            return Err(ChainOperationError::TransactionFailed(format!("Failed to build get_exit_nodes call: {:?}", e)));
+        }
+        
+        let programmable_transaction = ptb.finish();
+        
+        let (sui, sender) = self.setup_for_read().await
+                                    .map_err(|e| ChainOperationError::SetupReadFailed(format!("Sui Client setup for reading failed: {}", e)))?;
+        
+        let gas_budget = 10_000_000;
+        let gas_price = sui.read_api().get_reference_gas_price().await
+            .map_err(|e| ChainOperationError::GetSuiPriceFailed(format!("Failed to get Sui gas price: {:?}", e)))?;
+
+        // Build transaction data for inspection (read-only, no execution)
+        let tx_data = TransactionData::new_programmable(
+            sender,
+            vec![], // No gas coins needed for inspection
+            programmable_transaction,
+            gas_budget,
+            gas_price
+        );
+                
+        // Use dev_inspect_transaction_block for read-only execution
+        let inspect_result = sui_client
+            .read_api()
+            .dev_inspect_transaction_block(
+                sender,
+                tx_data.kind().clone(),
+                Some(gas_price.into()),
+                None, // No specific epoch
+                None, // No additional options
+            )
+            .await
+            .map_err(|e| ChainOperationError::TransactionFailed(format!("Failed to inspect get_exit_nodes transaction: {}", e)))?;
+
+        // Parse the results from the inspection
+        let res = match inspect_result.effects.status() {
+            SuiExecutionStatus::Success => Ok(()),
+            SuiExecutionStatus::Failure {error: e} => {
+                // Check if the error is due to network not found
+                if e.contains("E_NETWORK_NOT_FOUND") || e.contains("NETWORK_NOT_FOUND") {
+                    tracing::info!("Network '{}' not found on blockchain", network_name);
+                    return Ok(vec![]); // Return empty vector for non-existent network
+                }
+                tracing::error!("contract error: {}", e);
+                return Err(ChainOperationError::DevInspectTransactionBlockFailed(format!("Failed to dev_inspect_transaction_block: {}", e)));
+            }
+        };
+
+        if res.is_err() {
+            return Err(res.unwrap_err());
+        }
+
+        let mut exit_nodes = Vec::new();
+
+        if let Some(results) = inspect_result.results {
+            for result in results.iter() {
+                for return_value in result.return_values.iter() {
+                    // Handle empty return values
+                    if return_value.0.is_empty() {
+                        tracing::info!("Empty return value - no exit nodes found for network '{}'", network_name);
+                        continue;
+                    }
+                    
+                    match self.parse_exit_nodes_data(&return_value.0) {
+                        Ok(parsed_nodes) => {
+                            exit_nodes.extend(parsed_nodes);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse exit nodes data for '{}': {}", network_name, e);
+                            return Err(ChainOperationError::ResultParseError(format!("Failed to parse exit nodes result: {}", e)));
+                        }
+                    }
+                }
+            }
+        }
+        
+        tracing::info!("Retrieved {} exit nodes for network '{}'", exit_nodes.len(), network_name);
+        Ok(exit_nodes)
     }
 
     async fn pick_exit_node(&self, network_name: &str) -> ChainResult<Option<ExitNodeInfo>> {
