@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use serde::{Deserialize, Serialize};
 
 use crate::common::PeerId;
 
@@ -92,7 +93,7 @@ pub struct NetworkDetails {
 }
 
 /// Exit node information for networks
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExitNodeInfo {
     pub peer_id: PeerId,
     pub connector_uri_list: Vec<String>,

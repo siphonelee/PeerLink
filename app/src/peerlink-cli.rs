@@ -23,7 +23,7 @@ use tabled::settings::Style;
 use tokio::time::timeout;
 
 use peerlink::{
-    chain_op::{sui::SuiChainOperator, ChainOperationInterface}, common::{
+    chain_op::{sui::SuiChainOperator, ChainOperationInterface, ExitNodeInfo}, common::{
         config::{PortForwardConfig, load_sui_config},
         constants::PEERLINK_VERSION,
         stun::{StunInfoCollector, StunInfoCollectorTrait},
@@ -216,6 +216,29 @@ enum NetworkSubCommand {
     Reactivate {
         #[arg(help = "Network name")]
         name: String,
+    },
+    /// Get exit nodes for a network
+    ExitNodes {
+        #[arg(help = "Network name")]
+        name: String,
+    },
+    /// Remove an exit node from a network
+    RemoveExitNode {
+        #[arg(help = "Network name")]
+        name: String,
+        #[arg(help = "Peer ID of the exit node to remove")]
+        peer_id: u32,
+    },
+    /// Add an exit node to a network
+    AddExitNode {
+        #[arg(help = "Network name")]
+        name: String,
+        #[arg(help = "Peer ID of the exit node")]
+        peer_id: u32,
+        #[arg(help = "Hostname of the exit node")]
+        hostname: String,
+        #[arg(help = "Connector URIs (comma-separated)")]
+        connector_uris: String,
     },
 }
 
@@ -1576,6 +1599,235 @@ impl CommandHandler<'_> {
         
         Ok(())
     }
+
+    async fn handle_network_exit_nodes(&self, name: &str) -> Result<(), Error> {
+        // Validate input
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("Network name cannot be empty"));
+        }
+        
+        let sui_config = load_sui_config()?;
+        let chain_op = SuiChainOperator::new(
+            sui_config.private_key,
+            sui_config.package_id,
+            sui_config.registry_version,
+            sui_config.registry_digest,
+            sui_config.registry_id,
+        );
+        
+        match chain_op.get_exit_nodes(name).await {
+            Ok(exit_nodes) => {
+                if self.output_format == &OutputFormat::Json {
+                    let result = serde_json::json!({
+                        "success": true,
+                        "network_name": name,
+                        "exit_nodes": exit_nodes,
+                        "count": exit_nodes.len()
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    if exit_nodes.is_empty() {
+                        println!("No exit nodes found for network '{}'", name);
+                    } else {
+                        // Table format output
+                        #[derive(tabled::Tabled, serde::Serialize)]
+                        struct ExitNodeTableItem {
+                            peer_id: String,
+                            hostname: String,
+                            connector_uris: String,
+                            status: String,
+                            registered_at: String,
+                        }
+
+                        let display_nodes: Vec<ExitNodeTableItem> = exit_nodes
+                            .into_iter()
+                            .map(|node| ExitNodeTableItem {
+                                peer_id: node.peer_id.to_string(),
+                                hostname: node.hostname,
+                                connector_uris: node.connector_uri_list.join(", "),
+                                status: if node.is_active { "Active" } else { "Inactive" }.to_string(),
+                                registered_at: {
+                                    // Convert timestamp to human-readable format
+                                    let timestamp_ms = node.registered_at;
+                                    let timestamp_secs = timestamp_ms / 1000;
+                                    match chrono::DateTime::from_timestamp(timestamp_secs as i64, ((timestamp_ms % 1000) * 1_000_000) as u32) {
+                                        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                                        None => timestamp_ms.to_string(),
+                                    }
+                                },
+                            })
+                            .collect();
+
+                        print_output(&display_nodes, self.output_format)?;
+                    }
+                }
+            }
+            Err(e) => {
+                if self.output_format == &OutputFormat::Json {
+                    let error_result = serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                        "network_name": name
+                    });
+                    println!("{}", serde_json::to_string_pretty(&error_result)?);
+                } else {
+                    eprintln!("Failed to get exit nodes for network '{}': {}", name, e);
+                }
+                return Err(e.into());
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn handle_network_remove_exit_node(&self, name: &str, peer_id: u32) -> Result<(), Error> {
+        tracing::info!("Removing exit node {} from network '{}'", peer_id, name);
+        
+        // Validate inputs
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("Network name cannot be empty"));
+        }
+        
+        let sui_config = load_sui_config()?;
+        let chain_op = SuiChainOperator::new(
+            sui_config.private_key,
+            sui_config.package_id,
+            sui_config.registry_version,
+            sui_config.registry_digest,
+            sui_config.registry_id,
+        );
+        
+        match chain_op.remove_exit_node(name, peer_id).await {
+            Ok(response) => {
+                if self.output_format == &OutputFormat::Json {
+                    let result = serde_json::json!({
+                        "success": true,
+                        "network_name": name,
+                        "peer_id": peer_id,
+                        "transaction_id": response.transaction_id,
+                        "gas_used": response.gas_used
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("Successfully removed exit node {} from network '{}'", peer_id, name);
+                    println!("Transaction ID: {}", response.transaction_id);
+                    if let Some(gas_used) = response.gas_used {
+                        println!("Gas used: {}", gas_used);
+                    }
+                }
+            }
+            Err(e) => {
+                if self.output_format == &OutputFormat::Json {
+                    let error_result = serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                        "network_name": name,
+                        "peer_id": peer_id
+                    });
+                    println!("{}", serde_json::to_string_pretty(&error_result)?);
+                } else {
+                    eprintln!("Failed to remove exit node {} from network '{}': {}", peer_id, name, e);
+                }
+                return Err(e.into());
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn handle_network_add_exit_node(&self, name: &str, peer_id: u32, hostname: &str, connector_uris: &str) -> Result<(), Error> {
+        tracing::info!("Adding exit node {} to network '{}'", peer_id, name);
+        
+        // Validate inputs
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("Network name cannot be empty"));
+        }
+        if hostname.is_empty() {
+            return Err(anyhow::anyhow!("Hostname cannot be empty"));
+        }
+        if connector_uris.is_empty() {
+            return Err(anyhow::anyhow!("Connector URIs cannot be empty"));
+        }
+        
+        // Parse connector URIs from comma-separated string
+        let connector_uri_list: Vec<String> = connector_uris
+            .split(',')
+            .map(|uri| uri.trim().to_string())
+            .filter(|uri| !uri.is_empty())
+            .collect();
+        
+        if connector_uri_list.is_empty() {
+            return Err(anyhow::anyhow!("No valid connector URIs provided"));
+        }
+        
+        let sui_config = load_sui_config()?;
+        let chain_op = SuiChainOperator::new(
+            sui_config.private_key,
+            sui_config.package_id,
+            sui_config.registry_version,
+            sui_config.registry_digest,
+            sui_config.registry_id,
+        );
+        
+        // Create ExitNodeInfo struct
+        let exit_node = ExitNodeInfo {
+            peer_id,
+            connector_uri_list,
+            hostname: hostname.to_string(),
+            is_active: true, // New exit nodes are active by default
+            registered_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        
+        match chain_op.add_exit_node(name, exit_node).await {
+            Ok(response) => {
+                if self.output_format == &OutputFormat::Json {
+                    let result = serde_json::json!({
+                        "success": true,
+                        "network_name": name,
+                        "exit_node": {
+                            "peer_id": peer_id,
+                            "hostname": hostname,
+                            "connector_uris": connector_uris
+                        },
+                        "transaction_id": response.transaction_id,
+                        "gas_used": response.gas_used
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("Successfully added exit node {} to network '{}'", peer_id, name);
+                    println!("Hostname: {}", hostname);
+                    println!("Connector URIs: {}", connector_uris);
+                    println!("Transaction ID: {}", response.transaction_id);
+                    if let Some(gas_used) = response.gas_used {
+                        println!("Gas used: {}", gas_used);
+                    }
+                }
+            }
+            Err(e) => {
+                if self.output_format == &OutputFormat::Json {
+                    let error_result = serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                        "network_name": name,
+                        "exit_node": {
+                            "peer_id": peer_id,
+                            "hostname": hostname,
+                            "connector_uris": connector_uris
+                        }
+                    });
+                    println!("{}", serde_json::to_string_pretty(&error_result)?);
+                } else {
+                    eprintln!("Failed to add exit node {} to network '{}': {}", peer_id, name, e);
+                }
+                return Err(e.into());
+            }
+        }
+        
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1947,6 +2199,15 @@ async fn main() -> Result<(), Error> {
                 }
                 Some(NetworkSubCommand::Reactivate { name }) => {
                     handler.handle_network_reactivate(&name).await?;
+                }
+                Some(NetworkSubCommand::ExitNodes { name }) => {
+                    handler.handle_network_exit_nodes(&name).await?;
+                }
+                Some(NetworkSubCommand::RemoveExitNode { name, peer_id }) => {
+                    handler.handle_network_remove_exit_node(&name, peer_id).await?;
+                }
+                Some(NetworkSubCommand::AddExitNode { name, peer_id, hostname, connector_uris }) => {
+                    handler.handle_network_add_exit_node(&name, peer_id, &hostname, &connector_uris).await?;
                 }
             }
         }

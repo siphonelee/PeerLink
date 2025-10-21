@@ -1296,8 +1296,6 @@ impl ChainOperationInterface for SuiChainOperator {
     }
 
     async fn remove_exit_node(&self, network_name: &str, peer_id: PeerId) -> ChainResult<TransactionResponse> {
-        tracing::info!("Removing exit node {} from network '{}' on Sui blockchain", peer_id, network_name);
-        
         // Validate inputs
         if network_name.is_empty() {
             return Err(ChainOperationError::InvalidNetworkName(network_name.to_string()));
